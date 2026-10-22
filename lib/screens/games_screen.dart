@@ -52,13 +52,13 @@ class _GamesScreenState extends State<GamesScreen> {
       controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setBackgroundColor(const Color(0xFF0B0B0F))
-        ..loadFile(asset);
+        ..loadFlutterAsset(asset);
       (controller.platform as AndroidWebViewController)
         ..setMediaPlaybackRequiresUserGesture(false);
     } else {
       controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
-        ..loadFile(asset);
+        ..loadFlutterAsset(asset);
     }
     return WebViewWidget(controller: controller);
   }

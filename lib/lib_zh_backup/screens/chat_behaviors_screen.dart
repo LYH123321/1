@@ -48,34 +48,30 @@ class _ChatBehaviorsScreenState extends State<ChatBehaviorsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Behaviors')),
+      appBar: AppBar(title: const Text('行为设置')),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
         children: [
           // ── How it works ──────────────────────────────────────────────
           const HowItWorksCard(
-            title: 'How behaviors work',
-            subtitle: 'What each toggle controls.',
+            title: '行为设置说明',
+            subtitle: '每个开关控制什么。',
             sections: [
-              HowItWorksSection('What it is', [
+              HowItWorksSection('这是什么', [
                 HowItWorksBlock.paragraph(
-                    'These settings control how a chat **behaves** during '
-                    'use — what deleting a message does, whether new chats '
-                    'ask for a persona, and how replies are displayed as '
-                    'they generate.'),
+                    '这些设置控制聊天过程中的**行为** —— 删除消息时做什么、'
+                    '新建聊天是否先选人设、回复生成时如何显示。'),
                 HowItWorksBlock.paragraph(
-                    'They\'re **global** — they apply to every chat, not '
-                    'just the one you came from.'),
+                    '它们是**全局设置** —— 对所有聊天生效，'
+                    '不只是当前这个。'),
               ]),
-              HowItWorksSection('The toggles', [
+              HowItWorksSection('各开关说明', [
                 HowItWorksBlock.bullet(
-                    '**Delete behavior** — choose whether deleting a '
-                    'message removes only that one, or that message and '
-                    'everything after it.'),
+                    '**删除行为** —— 选择删除一条消息时，是只删这一条，'
+                    '还是连它之后的所有消息一起删除。'),
                 HowItWorksBlock.bullet(
-                    '**Ask persona on new chat** — when on, starting a new '
-                    'chat opens the persona picker first; when off, it uses '
-                    'your default persona automatically.'),
+                    '**新聊天询问人设** —— 开启后，新建聊天会先弹出人设'
+                    '选择器；关闭后自动使用默认人设。'),
                 // Audit B4(b): the Streaming bullet left with its toggle —
                 // replies always stream; describing a removed switch here
                 // would be stale help text.
@@ -90,11 +86,11 @@ class _ChatBehaviorsScreenState extends State<ChatBehaviorsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Delete behavior',
+                  const Text('删除行为',
                       style: TextStyle(fontWeight: FontWeight.w600)),
                   const SizedBox(height: 2),
                   Text(
-                    'When you delete a message in a chat.',
+                    '在聊天中删除一条消息时的处理方式。',
                     style:
                         TextStyle(color: EmberColors.textMid, fontSize: 12),
                   ),
@@ -103,11 +99,11 @@ class _ChatBehaviorsScreenState extends State<ChatBehaviorsScreen> {
                     segments: const [
                       ButtonSegment(
                         value: DeleteBehavior.onlyThis,
-                        label: Text('Only this message'),
+                        label: Text('仅此消息'),
                       ),
                       ButtonSegment(
                         value: DeleteBehavior.thisAndAfter,
-                        label: Text('This message and after'),
+                        label: Text('此消息及之后'),
                       ),
                     ],
                     selected: {_draft.deleteBehavior},
@@ -139,10 +135,10 @@ class _ChatBehaviorsScreenState extends State<ChatBehaviorsScreen> {
           Card(
             margin: const EdgeInsets.symmetric(vertical: 6),
             child: SwitchListTile(
-              title: const Text('Ask persona on new chat',
+              title: const Text('新聊天询问人设',
                   style: TextStyle(fontWeight: FontWeight.w600)),
               subtitle: Text(
-                'When ON, starting a new chat with a character opens the persona picker first. When OFF, it uses your default persona automatically.',
+                '开启后，新建角色聊天会先弹出人设选择器；关闭后自动使用默认人设。',
                 style:
                     TextStyle(color: EmberColors.textMid, fontSize: 12),
               ),

@@ -45,74 +45,72 @@ class ChatSettingsScreen extends StatelessWidget {
           // are the same, now grouped so "memory" / "how the model responds" /
           // "how the chat looks" read as distinct intents instead of one flat
           // list. Section labels only — no new screens, no hidden accordions.
-          _sectionLabel('Chat experience'),
+          _sectionLabel('聊天体验'),
           _HubCard(rows: [
             _HubRow(
               icon: Icons.palette_outlined,
-              title: 'Customize Chat',
-              subtitle: 'Bubbles, background, and reasoning display.',
+              title: '自定义聊天',
+              subtitle: '气泡、背景与推理内容显示。',
               builder: (_) => const ChatAppearanceScreen(),
             ),
             _HubRow(
               icon: Icons.tune,
-              title: 'Behaviors',
-              subtitle: 'Delete, new-chat persona, and streaming.',
+              title: '行为设置',
+              subtitle: '删除消息、新聊天人设与流式输出。',
               builder: (_) => const ChatBehaviorsScreen(),
             ),
           ]),
           const SizedBox(height: 18),
-          _sectionLabel('Replies & prompting'),
+          _sectionLabel('回复与提示词'),
           _HubCard(rows: [
             _HubRow(
               icon: Icons.settings_suggest_outlined,
-              title: 'Presets',
-              subtitle: 'Sampling defaults and prompt presets.',
+              title: '预设',
+              subtitle: '采样默认值与提示词预设。',
               builder: (_) => const PresetsScreen(),
             ),
             _HubRow(
               icon: Icons.find_replace,
-              title: 'Regex (find/replace)',
-              subtitle: 'Rewrite chat text on the fly (non-destructive).',
+              title: '正则（查找替换）',
+              subtitle: '即时改写聊天文本（不破坏原文）。',
               builder: (_) => const RegexRulesScreen(),
             ),
           ]),
           const SizedBox(height: 18),
-          _sectionLabel('Story continuity'),
+          _sectionLabel('故事连续性'),
           _HubCard(rows: [
             _HubRow(
               icon: Icons.psychology,
-              title: 'Checkpoints',
-              subtitle: 'Auto-summarise older messages into a recap.',
+              title: '检查点',
+              subtitle: '自动总结旧消息生成剧情回顾。',
               builder: (_) => const LongTermMemoryScreen(),
             ),
             _HubRow(
               icon: Icons.checklist_rtl,
-              title: 'Live Sheet',
-              subtitle: 'Track each character\'s current state.',
+              title: '实时表单',
+              subtitle: '追踪每个角色的当前状态。',
               builder: (_) => const LiveSheetSettingsScreen(),
             ),
             _HubRow(
               icon: Icons.map_outlined,
-              title: 'Script',
-              subtitle: 'Plant plot beats the story builds toward.',
+              title: '剧情脚本',
+              subtitle: '规划故事走向的情节节点。',
               builder: (_) => const ScriptSettingsScreen(),
             ),
           ]),
           const SizedBox(height: 18),
-          _sectionLabel('One-shot tools'),
+          _sectionLabel('一次性工具'),
           _HubCard(rows: [
             _HubRow(
               icon: Icons.explore_outlined,
-              title: 'Guide',
-              subtitle:
-                  'Steer the next reply, or draft your own message from an outline.',
+              title: '引导回复',
+              subtitle: '引导下一条回复，或按提纲代写消息。',
               builder: (_) => const GuideSettingsScreen(),
             ),
             _HubRow(
               icon: Icons.smart_toy_outlined,
-              title: 'System note',
-              subtitle:
-                  'Show the one-off /sys system-note action in the chat menu (off by default).',
+              title: '系统备注',
+              subtitle: '在聊天菜单显示 /sys 系统备注操作（默认关闭）。',
               builder: (_) => const SystemNoteSettingsScreen(),
             ),
           ]),
