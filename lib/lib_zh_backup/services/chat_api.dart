@@ -1,0 +1,2038 @@
+// OpenAI-compatible /v1/chat/completions client with SSE streaming.
+// Mirrors js/api.js — keeps prompt construction caller-side (the chat screen
+// composes the system prompt + history before calling here).
+
+import 'dart:async';
+import 'dart:convert';
+// Wave CY.18.46: dart:io doesn't exist on Flutter Web. We import it
+// only for `SocketException` (used as a typed marker in
+// `_classifyNetworkError`) and ONLY guard the runtime check with
+// `e is SocketException`. The companion string-match fallback below
+// catches the same condition on web (where SocketException isn't a
+// thing) by looking at `e.toString()`. So the import stays needed on
+// desktop + mobile and the future web build will swap to a conditional
+// (`if (dart.library.io) 'dart:io' show SocketException;`) once the
+// web target is actually enabled. For now, desktop + mobile only.
+import 'dart:io' show SocketException;
+
+import 'package:flutter/foundation.dart'
+    show debugPrint, kIsWeb, visibleForTesting;
+import 'package:http/http.dart' as http;
+
+import '../models/models.dart';
+import 'lan_client.dart';
+import 'llm_debug_log.dart';
+import 'param_policy.dart';
+import 'prompt_post_processing.dart';
+import 'resolvers.dart' show isProviderHostAllowed;
+import 'streaming_http_client.dart';
+
+typedef ChatRole = String; // 'system' | 'user' | 'assistant'
+
+@visibleForTesting
+http.Client Function()? debugHttpClientFactory;
+
+class ChatTurn {
+  final ChatRole role;
+  final String content;
+
+  /// Optional image data URLs (`data:image/<fmt>;base64,...`). When
+  /// present, the message is serialised in OpenAI's multimodal
+  /// content-array form so vision-capable models can see the image.
+  /// Plain-text-only models will reject the request — that's the
+  /// signal to the user that they need a vision-capable provider.
+  final List<String>? imageDataUrls;
+  ChatTurn(this.role, this.content, {this.imageDataUrls});
+
+  Map<String, dynamic> toJson() {
+    final images = imageDataUrls;
+    if (images == null || images.isEmpty) {
+      return {'role': role, 'content': content};
+    }
+    return {
+      'role': role,
+      'content': [
+        if (content.isNotEmpty) {'type': 'text', 'text': content},
+        for (final url in images)
+          {
+            'type': 'image_url',
+            'image_url': {'url': url},
+          },
+      ],
+    };
+  }
+}
+
+/// Wire format for browser -> LAN host chat proxy messages.
+///
+/// This mirrors [ChatTurn.toJson] so web/PWA keeps multimodal turns intact
+/// instead of flattening them to text before they reach the paired host.
+Map<String, dynamic> lanProxyMessageJson(ChatTurn turn) => turn.toJson();
+
+/// Decode one browser-proxied chat message back into [ChatTurn].
+///
+/// Accepts both the legacy string-content shape and OpenAI's multimodal
+/// content-array shape emitted by [ChatTurn.toJson].
+ChatTurn chatTurnFromLanProxyJson(Map raw) {
+  final role = (raw['role'] as String?) ?? 'user';
+  final content = raw['content'];
+  if (content is String) return ChatTurn(role, content);
+  if (content is List) {
+    final text = StringBuffer();
+    final images = <String>[];
+    for (final block in content) {
+      if (block is! Map) continue;
+      if (block['type'] == 'text') {
+        final t = block['text'];
+        if (t is String && t.isNotEmpty) {
+          if (text.isNotEmpty) text.write('\n\n');
+          text.write(t);
+        }
+      } else if (block['type'] == 'image_url') {
+        final img = block['image_url'];
+        final url = img is Map ? img['url'] : null;
+        if (url is String && url.isNotEmpty) images.add(url);
+      }
+    }
+    return ChatTurn(
+      role,
+      text.toString(),
+      imageDataUrls: images.isEmpty ? null : images,
+    );
+  }
+  return ChatTurn(role, '');
+}
+
+/// Wave CY.18.267 (Pyre 1.1): adapt [ChatTurn]s through the SillyTavern-style
+/// [PromptPostProcessing] reshaper, then hand back [ChatTurn]s ready to
+/// serialise. This is the single thin bridge between chat_api's message type
+/// and the pure, Flutter-free engine in prompt_post_processing.dart.
+///
+/// Applied at the request-body chokepoint shared by BOTH [streamChatCompletion]
+/// (via [buildRequestBody]) and [completeChat], so EVERY call type (chat,
+/// creator, LTM, vision, scene) to a provider respects its configured format
+/// requirement — a model that needs a strict array needs it everywhere.
+///
+/// Two short-circuits keep [PromptPostProcessing.none] (the default) and the
+/// existing request body byte-identical:
+///  1. [PromptPostProcessing.none] returns the SAME list reference untouched.
+///  2. If ANY turn carries image attachments, the list is returned untouched.
+///     Reshaping (merging / collapsing) is a TEXT operation; folding an
+///     image-bearing turn into another would drop the image. The strict
+///     models this targets (DeepSeek, GLM, Mistral, Claude text routes, many
+///     open weights) are text-only, so this guard costs nothing in practice
+///     and never silently loses a picture.
+List<ChatTurn> applyPromptPostProcessing(
+  List<ChatTurn> messages,
+  PromptPostProcessing mode,
+) {
+  if (mode == PromptPostProcessing.none) return messages;
+  // Don't reshape arrays that contain vision attachments (see doc above).
+  final hasImages = messages.any(
+    (m) => m.imageDataUrls != null && m.imageDataUrls!.isNotEmpty,
+  );
+  if (hasImages) return messages;
+
+  final pp = [for (final m in messages) PpMessage(m.role, m.content)];
+  final out = applyPromptPostProcessingRoles(pp, mode);
+  // `none`/no-op paths in the engine can hand back the same reference; either
+  // way the round-trip back to ChatTurn is cheap and lossless for text.
+  return [for (final m in out) ChatTurn(m.role, m.content)];
+}
+
+/// Wave CY.18.45: classify failure modes so the UI can pick the right
+/// message. Pre-Wave every failure was a generic `ChatApiError` and the
+/// chat screen showed the raw `toString()` to the user — which for a
+/// `SocketException` reads "SocketException: Failed host lookup: ..."
+/// in console-speak. Users on flaky mobile connections couldn't tell
+/// "API server returned 500" (their provider's problem) from "your
+/// phone has no internet" (their own connection). Now: callers
+/// translate the typed kind into a human snackbar.
+enum ChatApiErrorKind {
+  /// No connection at all — DNS lookup failed, no route to host, etc.
+  /// User should check wifi/data, then retry.
+  offline,
+
+  /// Connection established but the server didn't respond in time, OR
+  /// the stream stalled mid-flight. Likely a flaky network or an
+  /// overloaded provider. Retry usually fixes it.
+  timeout,
+
+  /// Server responded with a 4xx / 5xx, or returned a malformed body.
+  /// User probably has a misconfigured provider (wrong URL, bad
+  /// API key, model name doesn't exist).
+  server,
+
+  /// Anything we couldn't classify — fallback bucket. Treated like
+  /// `server` in the UI but worth a separate slot for diagnostics.
+  other,
+}
+
+class ChatApiError implements Exception {
+  final int? statusCode;
+  final String message;
+
+  /// Wave CY.18.45: see [ChatApiErrorKind].
+  final ChatApiErrorKind kind;
+  ChatApiError(
+    this.message, {
+    this.statusCode,
+    this.kind = ChatApiErrorKind.server,
+  });
+
+  /// Convenience factory for "DNS failed / no route / connection
+  /// refused". Used by the network-error wrappers around the http
+  /// calls.
+  factory ChatApiError.offline([String? message]) => ChatApiError(
+    message ??
+        'You appear to be offline. Check your connection and try '
+            'again.',
+    kind: ChatApiErrorKind.offline,
+  );
+
+  /// Convenience factory for "server didn't respond in time".
+  factory ChatApiError.timeout([String? message]) => ChatApiError(
+    message ?? 'The request timed out. The server may be busy.',
+    kind: ChatApiErrorKind.timeout,
+  );
+
+  @override
+  String toString() => 'ChatApiError($statusCode): $message';
+}
+
+/// Wave CY.18.45: classify a raw exception thrown anywhere inside the
+/// HTTP / SSE pipeline into a [ChatApiError] with the right kind.
+/// Pass it the original `Object e` from a `try { ... } catch (e)`
+/// block; it returns the ChatApiError to rethrow.
+ChatApiError _classifyNetworkError(Object e) {
+  // Already classified — just bubble.
+  if (e is ChatApiError) return e;
+  final s = e.toString();
+  // SocketException covers DNS-fail, connection refused, no route to
+  // host, etc. Dart's `package:http` also wraps these in
+  // `http.ClientException` on some platforms — match by class name +
+  // message text since neither type is imported here cleanly.
+  final lower = s.toLowerCase();
+  if (e is SocketException ||
+      lower.contains('socketexception') ||
+      lower.contains('failed host lookup') ||
+      lower.contains('connection refused') ||
+      lower.contains('connection failed') ||
+      lower.contains('network is unreachable') ||
+      lower.contains('no address associated')) {
+    return ChatApiError.offline();
+  }
+  if (e is TimeoutException ||
+      lower.contains('timeoutexception') ||
+      lower.contains('timed out') ||
+      lower.contains('deadline exceeded')) {
+    return ChatApiError.timeout();
+  }
+  // Anything else — keep the original toString so debug logs stay
+  // informative, but mark as `other` so the UI doesn't dress it up
+  // with an offline-style message.
+  return ChatApiError(s, kind: ChatApiErrorKind.other);
+}
+
+/// Auth headers for a provider's REST calls that are NOT chat completions —
+/// the "Test connection" probe and the model browser's `GET /models`. The
+/// dialect must match what the chat path sends or the probe lies: an
+/// OpenAI-compatible provider authenticates with `Authorization: Bearer`,
+/// while a native Anthropic provider uses `x-api-key` + `anthropic-version`
+/// (2026-07-03: Test/Browse always sent Bearer, so a valid Claude key got a
+/// 401 and looked broken on the make-or-break screen).
+///
+/// An empty key returns no auth header — a keyless local server is valid.
+/// Pure and unit-tested (test/provider_rest_auth_headers_test.dart).
+Map<String, String> providerRestAuthHeaders({
+  required ApiFormat format,
+  required String apiKey,
+}) {
+  final key = apiKey.trim();
+  if (key.isEmpty) return const <String, String>{};
+  if (format == ApiFormat.anthropic) {
+    return {'x-api-key': key, 'anthropic-version': '2023-06-01'};
+  }
+  return {'Authorization': 'Bearer $key'};
+}
+
+/// Wave CY.1: scrub provider error bodies before surfacing them. Some
+/// proxies (and misconfigured OpenAI-compat servers) reflect the
+/// `Authorization: Bearer …` header into their 4xx response body. Same
+/// goes for `x-api-key` and a few other token-shaped headers seen in
+/// the wild. If that body lands in a Snackbar / exception toString /
+/// chat warning, the key is on-screen, screenshottable, and one paste
+/// away from leaking. This redacts both the `Bearer …` form and bare
+/// token shapes (the long base64/hex strings providers tend to issue).
+String scrubProviderBody(String body, {String? apiKey}) {
+  if (body.isEmpty) return body;
+  var s = body;
+  // `Bearer <token>` (any whitespace, any token chars).
+  s = s.replaceAll(
+    RegExp(r'[Bb]earer\s+[A-Za-z0-9._\-]{8,}'),
+    'Bearer [redacted]',
+  );
+  // Raw header echoes: `Authorization: ...` / `x-api-key: ...` /
+  // `api-key: ...` / `OpenAI-Organization: ...` until end-of-line.
+  // Dart's RegExp has no `(?i)` inline flag — pass `caseSensitive`
+  // explicitly. And `replaceAll(regex, String)` treats the replacement
+  // as a literal, so use `replaceAllMapped` to keep the matched
+  // header name in the redacted output.
+  s = s.replaceAllMapped(
+    RegExp(
+      r'(authorization|x-api-key|api[_-]?key|openai-organization)\s*[:=]\s*[^\s",}]+',
+      caseSensitive: false,
+    ),
+    (m) => '${m[1]}: [redacted]',
+  );
+  // Standalone OpenAI-style `sk-` / `sk_live_` / `pk_` etc. tokens that
+  // slipped through any structured field in the error JSON.
+  s = s.replaceAll(
+    RegExp(r'\b(sk|sk_live|sk_test|pk_live|pk_test|or)[\-_][A-Za-z0-9]{16,}\b'),
+    '[redacted-token]',
+  );
+  // Audit 2026-06-04 (M4): some providers echo the key inside a JSON `message`
+  // in an UNrecognized shape (no Bearer/sk- prefix), e.g. "Invalid API key:
+  // 9f3a8c…". The rules above miss those, so as a final pass redact any literal
+  // occurrence of the active key itself. Guard on length so a trivially short
+  // key can't nuke common substrings.
+  final k = apiKey?.trim() ?? '';
+  if (k.length >= 6) {
+    s = s.replaceAll(k, '[redacted-key]');
+  }
+  return s;
+}
+
+/// Party mode (owner request): one generation voices the WHOLE party in a
+/// scene, so the single-character `max_tokens` ceiling is too tight. Scales
+/// [base] up with [memberCount] members in the scene:
+///   - `memberCount <= 1` → [base] unchanged (byte-identical for every
+///     non-party chat, and for every caller that doesn't pass a count).
+///   - else → `base * (1 + 0.6*(memberCount-1))`, rounded, clamped to
+///     `[base, base*3]` (2 members ≈1.6x, 3 ≈2.2x, 4 ≈2.8x, 5+ capped 3x).
+///   - `base <= 0` passes through unchanged — 0/negative means
+///     "unset/unlimited" in this codebase (see chat_api.dart's Anthropic
+///     `rawMax <= 0` fallback and `ModelSettings.maxTokens`'s own default),
+///     so we must never invent a ceiling the user/provider didn't set.
+int partyScaledMaxTokens(int base, int memberCount) {
+  if (base <= 0) return base;
+  if (memberCount <= 1) return base;
+  final scale = 1 + 0.6 * (memberCount - 1);
+  final scaled = (base * scale).round();
+  final cap = base * 3;
+  if (scaled > cap) return cap;
+  if (scaled < base) return base;
+  return scaled;
+}
+
+/// Merge sampling values from a preset on top of the global ModelSettings,
+/// SillyTavern-style: each preset field is an OPTIONAL override. A null on
+/// the preset means "use the user's global default"; a non-null wins.
+///
+/// Returns a plain `{key: value}` map ready to spread into the request
+/// payload. Fields that the model server doesn't recognise are silently
+/// ignored on its end — we just send everything we know about so providers
+/// that support more params (OpenRouter, Soji, etc.) get to use them.
+///
+/// [partyMemberCount] scales the resolved `max_tokens` ceiling up for a
+/// party-mode scene (see [partyScaledMaxTokens]). Defaults to 1 — a no-op —
+/// so every existing caller stays byte-identical.
+Map<String, dynamic> _samplingPayload(
+  ModelSettings settings,
+  Preset? preset, {
+  int partyMemberCount = 1,
+}) {
+  // For temp/top_p/max_tokens we always send a value — fall back to the
+  // global setting. For the rest we ONLY include them when something
+  // actually sets them; otherwise we let the server use its defaults.
+  final temp = preset?.temperature ?? settings.temperature;
+  final topP = preset?.topP ?? settings.topP;
+  final maxTokens = partyScaledMaxTokens(
+    preset?.maxTokens ?? settings.maxTokens,
+    partyMemberCount,
+  );
+  // top_k: preset wins, else global (0 = disabled on our slider).
+  final topK = preset?.topK ?? settings.topK;
+  final out = <String, dynamic>{
+    'temperature': temp,
+    'top_p': topP,
+    'max_tokens': maxTokens,
+    if (topK != 0) 'top_k': topK,
+  };
+  // Pure preset-only fields — only include if set.
+  if (preset?.frequencyPenalty != null) {
+    out['frequency_penalty'] = preset!.frequencyPenalty;
+  }
+  if (preset?.presencePenalty != null) {
+    out['presence_penalty'] = preset!.presencePenalty;
+  }
+  if (preset?.minP != null) out['min_p'] = preset!.minP;
+  if (preset?.topA != null) out['top_a'] = preset!.topA;
+  if (preset?.repetitionPenalty != null) {
+    out['repetition_penalty'] = preset!.repetitionPenalty;
+  }
+  // 2026-07-04 (Gui approved): DRY anti-repetition — understood by
+  // llama.cpp / KoboldCpp / TabbyAPI (and some OpenRouter routes); everyone
+  // else silently ignores it (same send-everything philosophy as above,
+  // with safeBodyFor + the 400-retry backstop for strict providers).
+  if (preset?.dryMultiplier != null) {
+    out['dry_multiplier'] = preset!.dryMultiplier;
+  }
+  if (preset?.dryBase != null) out['dry_base'] = preset!.dryBase;
+  if (preset?.dryAllowedLength != null) {
+    out['dry_allowed_length'] = preset!.dryAllowedLength;
+  }
+  // 2026-07-04 (Gui approved): banned words — no universal name exists, so
+  // the same list rides under the aliases the popular RP backends accept:
+  // TabbyAPI `banned_strings`, vLLM/Aphrodite `bad_words`, KoboldCpp
+  // `banned_tokens` (accepts strings). Only sent when non-empty.
+  if (preset != null && preset.bannedWords.isNotEmpty) {
+    final words = preset.bannedWords;
+    out['banned_strings'] = words;
+    out['bad_words'] = words;
+    out['banned_tokens'] = words;
+  }
+  return out;
+}
+
+// Wave CY.18.120: kind-aware timeouts for LOCAL providers (LM Studio /
+// Ollama). A cold local server doesn't send HTTP response headers until
+// the model finishes its JIT load off disk — a 7B–70B model on a spinning
+// disk or a busy machine can take well over a minute before the first byte
+// comes back. The default 25s/45s/75s windows (great for hosted APIs that
+// respond in ms) would time that out before it ever started. These widened
+// windows ONLY apply when `provider.kind == ProviderKind.localhost`; every
+// non-local provider keeps the original tight timeouts unchanged.
+//  - connect:        4 min for the first response headers (covers a slow
+//                    cold JIT load + TCP/TLS handshake).
+//  - inter-chunk:    2 min of zero data once the SSE stream is open.
+//  - one-shot total: 5 min for a full non-streamed completion.
+const Duration _kLocalConnectTimeout = Duration(seconds: 240);
+const Duration _kLocalStreamStallTimeout = Duration(seconds: 120);
+const Duration _kLocalCompleteTimeout = Duration(seconds: 300);
+
+/// Build the OpenAI-style chat-completions request body. Extracted so it is
+/// unit-testable and so the structured-output pipeline can inject
+/// `response_format` via [extraBody]. [extraBody] is spread LAST, so it
+/// overrides a stale `response_format` (etc.) coming from
+/// `provider.extraParams`. When [extraBody] is null this is byte-identical to
+/// the previous inline body. The apiKey is NEVER in the body (it rides the
+/// Authorization header), so this map is safe to log.
+Map<String, dynamic> buildRequestBody({
+  required ApiProvider provider,
+  required ModelSettings settings,
+  required List<ChatTurn> messages,
+  Preset? preset,
+  List<String>? stop,
+  required bool stream,
+  Map<String, dynamic>? extraBody,
+  // Party mode: number of characters voiced in this scene. Defaults to 1 —
+  // a no-op that keeps the body byte-identical — see [partyScaledMaxTokens].
+  int partyMemberCount = 1,
+}) {
+  // Wave CY.18.267: reshape the assembled message array to this provider's
+  // configured format right before serialising. `none` (default) returns the
+  // same list reference, so the body stays byte-identical for existing users.
+  final processed = applyPromptPostProcessing(
+    messages,
+    provider.promptPostProcessing,
+  );
+  final body = <String, dynamic>{
+    // Per-provider extra params come FIRST so Pyre-managed fields
+    // (model, messages, stream, sampling) win on any conflict. The
+    // user can still inject orthogonal params here (reasoning toggle,
+    // safety_filter, etc.) without breaking the core request shape.
+    ...provider.extraParams,
+    'model': provider.model,
+    'messages': processed.map((m) => m.toJson()).toList(),
+    ..._samplingPayload(settings, preset, partyMemberCount: partyMemberCount),
+    if (stop != null && stop.isNotEmpty) 'stop': stop,
+    'stream': stream,
+    ...?extraBody,
+  };
+  // Mega-audit 2026-06-04: proactive per-kind/host param allowlist. For the
+  // handful of strict providers (OpenAI reasoning models, Mistral) this drops
+  // / renames the fields they'd hard-reject BEFORE the request goes out;
+  // default / unknown / localhost / OpenRouter / Venice get the SAME map
+  // reference back unchanged, so the body stays byte-identical for them. The
+  // universal 400-retry below is the reactive backstop for the long tail.
+  return safeBodyFor(provider, provider.model, body);
+}
+
+// ===========================================================================
+// Pyre 1.1.3: native Anthropic (/v1/messages) format adapter (pure helpers)
+// ===========================================================================
+//
+// Anthropic's API is NOT OpenAI-compatible: a `/v1/messages` endpoint, an
+// `x-api-key` + `anthropic-version` header pair, a TOP-LEVEL `system` field
+// (not a system message), a REQUIRED `max_tokens`, user/assistant-only messages
+// that must alternate starting with `user`, `stop_sequences` (not `stop`), and
+// a content-block SSE stream. These pure helpers translate Pyre's assembled
+// `List<ChatTurn>` into that shape and parse the stream. The OpenAI path is
+// untouched — these only run for `provider.format == ApiFormat.anthropic`.
+
+/// Parse a `data:<media>;base64,<data>` URL into an Anthropic image block.
+/// Returns null when [dataUrl] isn't a base64 data URL.
+Map<String, dynamic>? anthropicImageBlock(String dataUrl) {
+  final m = RegExp(
+    r'^data:([^;]+);base64,(.*)$',
+    dotAll: true,
+  ).firstMatch(dataUrl);
+  if (m == null) return null;
+  return {
+    'type': 'image',
+    'source': {'type': 'base64', 'media_type': m.group(1), 'data': m.group(2)},
+  };
+}
+
+/// The Anthropic `content` for one turn: a plain string when there are no
+/// images, else a content-block array (optional text block + image blocks).
+dynamic _anthropicContent(ChatTurn t) {
+  final imgs = t.imageDataUrls;
+  if (imgs == null || imgs.isEmpty) return t.content;
+  final blocks = <dynamic>[
+    if (t.content.isNotEmpty) {'type': 'text', 'text': t.content},
+  ];
+  for (final url in imgs) {
+    final b = anthropicImageBlock(url);
+    if (b != null) blocks.add(b);
+  }
+  return blocks.isEmpty ? t.content : blocks;
+}
+
+/// Build the native Anthropic `/v1/messages` request body. Pure + testable.
+///
+/// System-turn placement (Defect 2 fix, Pyre 1.1.3):
+/// Only the LEADING system turn(s) — those before the first user/assistant turn
+/// — belong in the top-level `system` field. Any system-role turn that appears
+/// AFTER the first user/assistant message (post-history jailbreak, mid-chat
+/// scene, roadmap, guide note) is converted to a `user`-role turn IN-ORDER so
+/// it reaches the model at the recency position where it was intended. The
+/// existing consecutive-same-role merge coalesces it with an adjacent user turn
+/// automatically, preserving Anthropic's role-alternation requirement. The
+/// leading system block stays in the top-level `system` field unchanged.
+///
+/// The rest become user/assistant messages with consecutive same-role turns
+/// MERGED and a leading assistant turn (the usual chat greeting) prefixed by a
+/// minimal user turn — Anthropic requires the first message to be `user`.
+/// `max_tokens` is required by Anthropic; `temperature` is clamped to 0..1.
+Map<String, dynamic> buildAnthropicBody({
+  required List<ChatTurn> messages,
+  required ModelSettings settings,
+  Preset? preset,
+  required String model,
+  required bool stream,
+  List<String>? stop,
+  Map<String, dynamic>? extraParams,
+  // Party mode: number of characters voiced in this scene. Defaults to 1 —
+  // a no-op that keeps the body byte-identical — see [partyScaledMaxTokens].
+  int partyMemberCount = 1,
+}) {
+  // 1. Split system turns: leading ones → top-level `system`; post-history
+  //    ones → converted to user turns inline (Defect 2 fix).
+  final systemParts = <String>[];
+  final convo = <ChatTurn>[];
+  var seenNonSystem = false;
+  for (final m in messages) {
+    if (m.role == 'system') {
+      if (!seenNonSystem) {
+        // Leading system turn — belongs in the top-level `system` field.
+        if (m.content.trim().isNotEmpty) systemParts.add(m.content);
+      } else {
+        // Post-history system turn — convert to user-role so it stays in
+        // position. The consecutive-same-role merge below will fold it into
+        // an adjacent user turn automatically if needed, preserving
+        // Anthropic's strict user/assistant alternation requirement.
+        if (m.content.trim().isNotEmpty) {
+          convo.add(ChatTurn('user', m.content));
+        }
+      }
+    } else {
+      seenNonSystem = true;
+      convo.add(m);
+    }
+  }
+  // 2. user/assistant messages, merging consecutive same-role turns.
+  final msgs = <Map<String, dynamic>>[];
+  for (final m in convo) {
+    final role = m.role == 'assistant' ? 'assistant' : 'user';
+    final content = _anthropicContent(m);
+    if (msgs.isNotEmpty && msgs.last['role'] == role) {
+      final prev = msgs.last['content'];
+      if (prev is String && content is String) {
+        msgs.last['content'] = '$prev\n\n$content';
+      } else {
+        final a = prev is List
+            ? List<dynamic>.from(prev)
+            : <dynamic>[
+                {'type': 'text', 'text': prev},
+              ];
+        final b = content is List
+            ? content
+            : <dynamic>[
+                {'type': 'text', 'text': content},
+              ];
+        msgs.last['content'] = [...a, ...b];
+      }
+    } else {
+      msgs.add({'role': role, 'content': content});
+    }
+  }
+  // 3. Anthropic requires the FIRST message to be `user`. A chat usually opens
+  //    with the assistant greeting → prepend a minimal user turn.
+  if (msgs.isNotEmpty && msgs.first['role'] == 'assistant') {
+    msgs.insert(0, {'role': 'user', 'content': '.'});
+  }
+  // 4. Sampling — reuse the shared payload, map to Anthropic names/ranges.
+  final sampling = _samplingPayload(
+    settings,
+    preset,
+    partyMemberCount: partyMemberCount,
+  );
+  final rawMax = (sampling['max_tokens'] as num?)?.toInt() ?? 4096;
+  final maxTokens = rawMax <= 0 ? 4096 : rawMax;
+  final body = <String, dynamic>{
+    ...?extraParams,
+    'model': model,
+    'max_tokens': maxTokens,
+    if (systemParts.isNotEmpty) 'system': systemParts.join('\n\n'),
+    'messages': msgs,
+    'stream': stream,
+  };
+  final temp = (sampling['temperature'] as num?)?.toDouble();
+  if (temp != null) body['temperature'] = temp.clamp(0.0, 1.0);
+  if (sampling['top_p'] != null) body['top_p'] = sampling['top_p'];
+  if (sampling['top_k'] != null) body['top_k'] = sampling['top_k'];
+  if (stop != null && stop.isNotEmpty) body['stop_sequences'] = stop;
+  return body;
+}
+
+/// Rebuild an Anthropic `/v1/messages` body keeping ONLY the managed keys:
+/// model, max_tokens, system, messages, stream, temperature, top_p, top_k,
+/// stop_sequences. Everything else (custom extraParams, reasoning, etc.) is
+/// dropped. This is the Anthropic-side analogue of [minimalRetryBody] and is
+/// used for the retry-without-extras backstop (Defect 1 fix, Pyre 1.1.3).
+///
+/// Pure: never mutates [body]. Terminates — the caller retries exactly once.
+Map<String, dynamic> minimalAnthropicRetryBody(Map<String, dynamic> body) {
+  const managed = {
+    'model',
+    'max_tokens',
+    'system',
+    'messages',
+    'stream',
+    'temperature',
+    'top_p',
+    'top_k',
+    'stop_sequences',
+  };
+  return {
+    for (final e in body.entries)
+      if (managed.contains(e.key)) e.key: e.value,
+  };
+}
+
+/// Extract the visible text delta from one parsed Anthropic SSE event, or null
+/// for non-text events (message_start/stop, content_block_start/stop, ping,
+/// thinking deltas).
+String? anthropicTextDelta(Map<String, dynamic> event) {
+  if (event['type'] != 'content_block_delta') return null;
+  final delta = event['delta'];
+  if (delta is! Map) return null;
+  if (delta['type'] != 'text_delta') return null;
+  final t = delta['text'];
+  return t is String ? t : null;
+}
+
+/// Pull a human-readable error out of an Anthropic `error` SSE event / body,
+/// or null when it isn't an error event.
+String? anthropicErrorMessage(Map<String, dynamic> event) {
+  if (event['type'] != 'error') return null;
+  final err = event['error'];
+  if (err is Map) {
+    final msg = err['message'];
+    if (msg is String && msg.isNotEmpty) return msg;
+    final type = err['type'];
+    if (type is String) return type;
+  }
+  return 'Anthropic error';
+}
+
+/// Extract the concatenated visible text from a FULL Anthropic message response
+/// (`content` is a list of typed blocks; we join the `text` blocks, skipping
+/// thinking/tool blocks). Used by the non-streamed paths.
+String anthropicTextFromMessage(dynamic obj) {
+  if (obj is! Map) return '';
+  final content = obj['content'];
+  if (content is! List) return '';
+  final buf = StringBuffer();
+  for (final block in content) {
+    if (block is Map && block['type'] == 'text' && block['text'] is String) {
+      buf.write(block['text'] as String);
+    }
+  }
+  return buf.toString();
+}
+
+/// Pyre 1.1.3: native Anthropic streaming. Mirrors [streamChatCompletion]'s HTTP
+/// machinery (same timeouts + error classification + scrubbing) but speaks the
+/// `/v1/messages` dialect: `x-api-key` + `anthropic-version` headers,
+/// [buildAnthropicBody] for the request, and the content-block SSE stream parsed
+/// by [anthropicTextDelta]. Only reached for `provider.format ==
+/// ApiFormat.anthropic`; the OpenAI path stays untouched.
+///
+/// Pyre 1.1.3 (Defect 1 fix): on a param-shape 4xx, rebuild with
+/// [minimalAnthropicRetryBody] and retry EXACTLY ONCE, mirroring the OpenAI
+/// streaming path's "retry-without-extras" backstop.
+Stream<String> _streamAnthropic({
+  required ApiProvider provider,
+  required ModelSettings settings,
+  required List<ChatTurn> messages,
+  Preset? preset,
+  List<String>? stop,
+  int partyMemberCount = 1,
+}) async* {
+  final url = Uri.parse(buildChatUrl(provider.baseUrl, 'messages'));
+  // `var` (not `final`) so the retry below can swap in the minimal-safe body,
+  // mirroring the OpenAI streaming path's pattern.
+  var body = buildAnthropicBody(
+    messages: messages,
+    settings: settings,
+    preset: preset,
+    model: provider.model,
+    stream: true,
+    stop: stop,
+    extraParams: provider.extraParams.isEmpty ? null : provider.extraParams,
+    partyMemberCount: partyMemberCount,
+  );
+  final client = debugHttpClientFactory?.call() ?? http.Client();
+  try {
+    // Build a fresh POST for the current `body`. Called twice at most: once
+    // normally, and once on a param-error retry with the minimal-safe body.
+    // Mirrors the OpenAI path's inner buildReq() closure.
+    http.Request buildReq() {
+      final r = http.Request('POST', url);
+      r.headers.addAll({
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        'anthropic-version': '2023-06-01',
+        if (provider.apiKey.isNotEmpty) 'x-api-key': provider.apiKey,
+        ..._sanitiseHeaders(provider.headers),
+      });
+      r.body = jsonEncode(body);
+      return r;
+    }
+
+    // Send and classify network-level errors.
+    Future<http.StreamedResponse> send() async {
+      try {
+        return await client
+            .send(buildReq())
+            .timeout(
+              provider.kind == ProviderKind.localhost
+                  ? _kLocalConnectTimeout
+                  : const Duration(seconds: 25),
+              onTimeout: () => throw ChatApiError.timeout(
+                'Timed out connecting to the Anthropic provider.',
+              ),
+            );
+      } catch (e) {
+        throw _classifyNetworkError(e);
+      }
+    }
+
+    var resp = await send();
+    if (resp.statusCode >= 400) {
+      final errBody = await resp.stream.bytesToString();
+      final scrubbed = scrubProviderBody(errBody, apiKey: provider.apiKey);
+      // Pyre 1.1.3 (Defect 1 fix): retry-without-extras on a param-shape 4xx,
+      // mirroring the OpenAI streaming path. Terminates — no loop; a second
+      // failure throws. This catches stray extraParams (e.g. frequency_penalty,
+      // response_format) that Anthropic /v1/messages rejects as unknown fields.
+      if (resp.statusCode < 500 && isUnsupportedParamError(scrubbed)) {
+        body = minimalAnthropicRetryBody(body);
+        resp = await send();
+        if (resp.statusCode >= 400) {
+          final retryBody = await resp.stream.bytesToString();
+          throw ChatApiError(
+            scrubProviderBody(retryBody, apiKey: provider.apiKey),
+            statusCode: resp.statusCode,
+          );
+        }
+      } else {
+        throw ChatApiError(scrubbed, statusCode: resp.statusCode);
+      }
+    }
+    // A provider that ignored `stream:true` returns a single JSON message —
+    // parse its content blocks rather than try to read SSE.
+    final contentType = (resp.headers['content-type'] ?? '').toLowerCase();
+    if (contentType.contains('application/json')) {
+      final raw = await resp.stream.bytesToString();
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        final err = anthropicErrorMessage(decoded.cast<String, dynamic>());
+        if (err != null) throw ChatApiError(err);
+      }
+      final text = anthropicTextFromMessage(decoded);
+      if (text.isNotEmpty) yield text;
+      return;
+    }
+    final lines = resp.stream
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .timeout(
+          provider.kind == ProviderKind.localhost
+              ? _kLocalStreamStallTimeout
+              : const Duration(seconds: 45),
+          onTimeout: (sink) {
+            sink.addError(
+              ChatApiError(
+                'Stream stalled — no data from the Anthropic provider for a while.',
+              ),
+            );
+            sink.close();
+          },
+        );
+    await for (final line in lines) {
+      if (line.isEmpty) continue;
+      // Anthropic SSE interleaves `event:` and `data:` lines; we only need data.
+      if (!line.startsWith('data:')) continue;
+      final payload = sseDataPayload(line).trim();
+      if (payload.isEmpty) continue;
+      Map<String, dynamic>? obj;
+      try {
+        final decoded = jsonDecode(payload);
+        if (decoded is Map) obj = decoded.cast<String, dynamic>();
+      } catch (_) {
+        continue; // ignore unparseable SSE noise
+      }
+      if (obj == null) continue;
+      final err = anthropicErrorMessage(obj);
+      if (err != null) throw ChatApiError(err);
+      final text = anthropicTextDelta(obj);
+      if (text != null && text.isNotEmpty) yield text;
+    }
+  } finally {
+    client.close();
+  }
+}
+
+/// Pyre 1.1.3: native Anthropic non-streaming completion (mirrors [completeChat]
+/// for `/v1/messages`). Used when a caller wants a one-shot result from an
+/// Anthropic-format provider.
+///
+/// Pyre 1.1.3 (Defect 1 fix): on a param-shape 4xx, rebuild with
+/// [minimalAnthropicRetryBody] and retry EXACTLY ONCE, mirroring the OpenAI
+/// [completeChat] path's "retry-without-extras" backstop.
+Future<String> _completeAnthropic({
+  required ApiProvider provider,
+  required ModelSettings settings,
+  required List<ChatTurn> messages,
+  Preset? preset,
+  List<String>? stop,
+}) async {
+  final url = Uri.parse(buildChatUrl(provider.baseUrl, 'messages'));
+  // `var` (not `final`) so the retry below can swap in the minimal-safe body,
+  // mirroring the OpenAI completeChat path's pattern.
+  var body = buildAnthropicBody(
+    messages: messages,
+    settings: settings,
+    preset: preset,
+    model: provider.model,
+    stream: false,
+    stop: stop,
+    extraParams: provider.extraParams.isEmpty ? null : provider.extraParams,
+  );
+
+  // POST the current `body`. Called twice at most: normally, then once on a
+  // param-error retry with the minimal-safe body. Mirrors the OpenAI path.
+  Future<http.Response> post() => http
+      .post(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          if (provider.apiKey.isNotEmpty) 'x-api-key': provider.apiKey,
+          ..._sanitiseHeaders(provider.headers),
+        },
+        body: jsonEncode(body),
+      )
+      .timeout(
+        provider.kind == ProviderKind.localhost
+            ? _kLocalCompleteTimeout
+            : const Duration(seconds: 75),
+        onTimeout: () =>
+            throw ChatApiError.timeout('Anthropic request timed out.'),
+      );
+
+  http.Response resp;
+  try {
+    resp = await post();
+  } catch (e) {
+    throw _classifyNetworkError(e);
+  }
+  if (resp.statusCode >= 400) {
+    final scrubbed = scrubProviderBody(resp.body, apiKey: provider.apiKey);
+    // Pyre 1.1.3 (Defect 1 fix): retry-without-extras on a param-shape 4xx,
+    // mirroring the OpenAI completeChat path. Terminates — no loop; a second
+    // failure throws. This catches stray extraParams (e.g. frequency_penalty,
+    // response_format) that Anthropic /v1/messages rejects as unknown fields.
+    if (resp.statusCode < 500 && isUnsupportedParamError(scrubbed)) {
+      body = minimalAnthropicRetryBody(body);
+      try {
+        resp = await post();
+      } catch (e) {
+        throw _classifyNetworkError(e);
+      }
+      if (resp.statusCode >= 400) {
+        throw ChatApiError(
+          scrubProviderBody(resp.body, apiKey: provider.apiKey),
+          statusCode: resp.statusCode,
+        );
+      }
+    } else {
+      throw ChatApiError(scrubbed, statusCode: resp.statusCode);
+    }
+  }
+  final obj = jsonDecode(resp.body);
+  if (obj is Map) {
+    final err = anthropicErrorMessage(obj.cast<String, dynamic>());
+    if (err != null) throw ChatApiError(err);
+  }
+  return anthropicTextFromMessage(obj);
+}
+
+/// Streams partial completions as they arrive. The returned stream yields
+/// incremental text chunks (not the cumulative buffer). Cancel the
+/// subscription to abort the request.
+///
+/// [stop] is an optional list of stop sequences forwarded to the provider
+/// via OpenAI's `stop` parameter. When the model emits any of these
+/// strings, the server cuts off generation IMMEDIATELY at the boundary.
+/// This is how the Character Creator enforces its per-block emission
+/// discipline — the prompt tells the model to write `<<BLOCK_END>>`
+/// after each block, and the server hard-stops there even when the
+/// model "wants" to keep barrelling through into the next block.
+/// Without this, prompt instructions alone can't override the model's
+/// trained instinct to complete the whole task in one turn.
+Stream<String> streamChatCompletion({
+  required ApiProvider provider,
+  required ModelSettings settings,
+  required List<ChatTurn> messages,
+  Preset? preset,
+  List<String>? stop,
+  // Wave CY.18.214: opt-in diagnostics tag. When the LlmDebugLog is
+  // enabled, the request body (KEY-FREE — see below) + the assembled
+  // response + duration are recorded to a local JSONL under this feature
+  // tag (`chat`, `ltm`, `livesheet`, `creator-architect`, `creator-vision`,
+  // `scene`). When null OR the log is disabled it is a STRICT no-op: we
+  // never build a record, never touch disk, zero overhead on the hot path.
+  String? debugTag,
+  // Extra request-body fields spread LAST onto the assembled body — the
+  // structured-output pipeline injects `response_format: {type:
+  // 'json_object'}` here. Null = byte-identical to the previous body.
+  Map<String, dynamic>? extraBody,
+  // BLOCKER 1: fired (at most once) when this call hit a param-shape 4xx and
+  // fell back to the minimal-safe body — i.e. the provider rejected one of the
+  // extra body fields (the Creator build's `response_format`). The build latches
+  // a per-build flag on this so it stops re-sending `response_format` on every
+  // subsequent batch. Null = no-op for every other caller.
+  void Function()? onParamFallback,
+  // Party mode: number of characters voiced in this reply (a joint scene).
+  // Scales the resolved `max_tokens` ceiling up so one generation has room
+  // to speak for the whole party — see [partyScaledMaxTokens]. Defaults to
+  // 1, which is a no-op: every existing / non-party caller is unaffected.
+  int partyMemberCount = 1,
+}) async* {
+  // Wave CY.18.71: web/PWA proxy mode. When running in a browser tab
+  // that's paired to a desktop Pyre server, we don't call the upstream
+  // LLM directly (CORS + no SecureKeys would mean exposing API keys in
+  // JS). Instead we POST to `/llm/stream` on the paired server, which
+  // makes the upstream call with ITS own SecureKeys-stored API key and
+  // streams the tokens back as SSE. The proxy preserves OpenAI-style
+  // multimodal image blocks and reasoning deltas, while native provider
+  // management/fallback/model browsing remain native-only. Native builds
+  // skip this entirely.
+  if (kIsWeb && LanClient.instance.isPaired) {
+    yield* _streamViaLanProxy(
+      provider: provider,
+      messages: messages,
+      stop: stop,
+    );
+    return;
+  }
+  if (provider.baseUrl.isEmpty) {
+    throw ChatApiError('Provider has no baseUrl configured');
+  }
+  // Pyre 1.1.3: native Anthropic (/v1/messages) providers take a completely
+  // separate request/parse path; the OpenAI code below stays untouched.
+  if (provider.format == ApiFormat.anthropic) {
+    yield* _streamAnthropic(
+      provider: provider,
+      settings: settings,
+      messages: messages,
+      preset: preset,
+      stop: stop,
+      partyMemberCount: partyMemberCount,
+    );
+    return;
+  }
+  final url = Uri.parse(buildChatUrl(provider.baseUrl, 'chat/completions'));
+
+  // Mega-audit 2026-06-04: `body` is non-final so the universal param-error
+  // retry below can swap in the minimal-safe body; the diagnostics closure
+  // captures it by reference and logs whichever body actually ran.
+  var body = buildRequestBody(
+    provider: provider,
+    settings: settings,
+    messages: messages,
+    preset: preset,
+    stop: stop,
+    stream: true,
+    extraBody: extraBody,
+    partyMemberCount: partyMemberCount,
+  );
+
+  // Wave CY.18.214: capture for the diagnostics log. The `body` map above
+  // is KEY-FREE by construction — the apiKey is set on the Authorization
+  // header below, never in the body — so we can log it as-is. We snapshot
+  // the timing + accumulate the yielded text and the captured finish
+  // reason, then write ONE record when the stream completes (success OR
+  // error). Guarded so it's a strict no-op when the log is off / untagged.
+  final bool shouldLog = debugTag != null && LlmDebugLog.instance.enabled;
+  final Stopwatch? logSw = shouldLog ? (Stopwatch()..start()) : null;
+  final StringBuffer? logBuf = shouldLog ? StringBuffer() : null;
+  String? logFinishReason;
+  // Emits the captured record exactly once; never throws into the stream.
+  var logDone = false;
+  void emitDebugRecord({String? parseOutcome}) {
+    if (!shouldLog || logDone) return;
+    logDone = true;
+    try {
+      LlmDebugLog.instance.record(
+        LlmCallRecord(
+          ts: DateTime.now().millisecondsSinceEpoch,
+          feature: debugTag,
+          provider: provider.name,
+          model: provider.model,
+          messages: (body['messages'] as List?) ?? const <dynamic>[],
+          sampling: <String, dynamic>{
+            for (final e in body.entries)
+              if (e.key != 'messages') e.key: e.value,
+          },
+          response: logBuf?.toString() ?? '',
+          finishReason: logFinishReason,
+          durationMs: logSw?.elapsedMilliseconds ?? 0,
+          parseOutcome: parseOutcome,
+        ),
+      );
+    } catch (_) {
+      // Never let diagnostics break a generation.
+    }
+  }
+
+  // Build a fresh POST for the current `body`. Called twice at most: once
+  // normally, and once on a param-error retry with the minimal-safe body.
+  http.Request buildReq() {
+    final r = http.Request('POST', url);
+    r.headers.addAll({
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+      if (provider.apiKey.isNotEmpty)
+        'Authorization': 'Bearer ${provider.apiKey}',
+      ..._sanitiseHeaders(provider.headers),
+    });
+    r.body = jsonEncode(body);
+    return r;
+  }
+
+  final client = debugHttpClientFactory?.call() ?? http.Client();
+  try {
+    // Wave CY.18.6: explicit timeouts so a silent stall surfaces as a
+    // real error instead of leaving the chat bubble stuck on
+    // "Generating…" forever. Real API errors (4xx/5xx) come back in
+    // milliseconds — these timeouts are ONLY for the pathological
+    // case where the connection is open but the server has gone
+    // silent (network drop without RST, hung proxy, dead worker).
+    //  - connect window: 25s for response headers (TCP + TLS +
+    //    request + provider routing all together — way more than
+    //    healthy servers need; reasoning latency hits AFTER headers).
+    //  - inter-chunk window: 45s of zero data once streaming is open.
+    // Both surface as ChatApiError → propagates through the listener's
+    // onError → _finishWithError → user-visible snackbar with Retry.
+    // Wave CY.18.45: classify any raw network / DNS / connection-refused
+    // exception into a typed `ChatApiError` BEFORE it bubbles out of the
+    // try/finally. Without this the chat screen got the raw
+    // SocketException toString ("Failed host lookup: ...") in a snackbar
+    // and the user couldn't tell if their phone was offline or the
+    // provider URL was wrong. Now: `kind: ChatApiErrorKind.offline` for
+    // DNS/no-route, `timeout` for stalls, `server` for HTTP 4xx/5xx,
+    // and the UI renders a friendly message per kind.
+    // Send the current `req` and return the response. Throws a classified
+    // network error on a connect-level failure / timeout.
+    Future<http.StreamedResponse> send(http.Request r) async {
+      try {
+        // Wave CY.18.120: local servers get a much longer connect window
+        // because a cold model can JIT-load for minutes before sending any
+        // response headers; hosted providers keep the tight 25s window.
+        return await client
+            .send(r)
+            .timeout(
+              provider.kind == ProviderKind.localhost
+                  ? _kLocalConnectTimeout
+                  : const Duration(seconds: 25),
+              onTimeout: () => throw ChatApiError.timeout(
+                'Timed out connecting to the provider. For local servers a '
+                'model may still be loading; check the server and try again.',
+              ),
+            );
+      } catch (e) {
+        throw _classifyNetworkError(e);
+      }
+    }
+
+    var resp = await send(buildReq());
+    if (resp.statusCode >= 400) {
+      final errBody = await resp.stream.bytesToString();
+      final scrubbed = scrubProviderBody(errBody, apiKey: provider.apiKey);
+      // Mega-audit 2026-06-04 (THE key fix): universal retry-without-extras.
+      // When a 4xx looks like a PARAMETER-shape rejection (unsupported /
+      // unrecognized / extra / mis-named param — see param_policy.dart),
+      // rebuild with the minimal safe set (model, messages, stream, token cap
+      // under both names) and retry EXACTLY ONCE. This makes the whole zoo of
+      // strict providers (OpenAI reasoning, Mistral, …) fail soft instead of
+      // dead-ending the user. Terminates — no loop; a second failure throws.
+      if (resp.statusCode < 500 && isUnsupportedParamError(scrubbed)) {
+        body = minimalRetryBody(body);
+        // BLOCKER 1: tell the caller a param field was rejected so a multi-call
+        // flow (the Creator build) can stop re-sending the rejected extras on
+        // its next call. Never let a misbehaving callback break the stream.
+        if (onParamFallback != null) {
+          try {
+            onParamFallback();
+          } catch (_) {}
+        }
+        resp = await send(buildReq());
+        if (resp.statusCode >= 400) {
+          final retryBody = await resp.stream.bytesToString();
+          throw ChatApiError(
+            scrubProviderBody(retryBody, apiKey: provider.apiKey),
+            statusCode: resp.statusCode,
+          );
+        }
+      } else {
+        // Wave CY.1: redact any leaked auth token/header before
+        // surfacing — the body is displayed in Snackbars / chat
+        // warnings.
+        throw ChatApiError(scrubbed, statusCode: resp.statusCode);
+      }
+    }
+
+    // Some providers silently ignore `stream: true` and return a
+    // regular JSON body. Detect this via Content-Type and fall back
+    // to one-shot parsing so the caller still gets the response.
+    // We only switch to JSON when the type is EXPLICITLY application/
+    // json — missing / generic types still try SSE first.
+    final contentType = (resp.headers['content-type'] ?? '').toLowerCase();
+    final isJson = contentType.contains('application/json');
+    if (isJson) {
+      // NOTE: named `jsonBody`, not `body`, to avoid shadowing the outer
+      // request `body` map that the `emitDebugRecord` diagnostics closure
+      // captures by lexical scope (Wave CY.18.214 code review MINOR-2).
+      //
+      // Bound the body read with the same kind-aware stall window the SSE
+      // branch applies to each chunk. A provider that ignores `stream:true`
+      // and returns a single JSON body could otherwise hold the socket open
+      // indefinitely (e.g. a model that hangs after sending headers) with no
+      // timeout at all, unlike the SSE path. Local servers get the longer
+      // window (a cold model can be slow to produce the full body); cloud
+      // keeps the tight 45s.
+      final jsonBody = await resp.stream.bytesToString().timeout(
+        provider.kind == ProviderKind.localhost
+            ? _kLocalStreamStallTimeout
+            : const Duration(seconds: 45),
+        onTimeout: () => throw ChatApiError.timeout(
+          'The provider returned a non-streamed response but stopped '
+          'sending data before the body finished. The connection is '
+          'open but the model has stopped responding.',
+        ),
+      );
+      try {
+        final obj = jsonDecode(jsonBody);
+        final choices = obj['choices'];
+        if (choices is List && choices.isNotEmpty) {
+          final msg = choices[0]['message'];
+          if (msg is Map) {
+            // Wrap reasoning content in <think> tags so the existing
+            // ChatText reasoning toggle hides it by default but the
+            // user can opt to see it.
+            //
+            // Wave BT: providers disagree on the field name —
+            //   - DeepSeek native / R1-style: `reasoning_content`
+            //   - OpenRouter (normalized): `reasoning`
+            //   - Some Qwen routes: also `reasoning`
+            // Read both so we don't silently drop reasoning tokens on
+            // a route that uses the shorter name. Dropping them
+            // manifested as "model returns empty" in the user's
+            // OpenRouter→DeepSeek V4 Pro setup (Wave BS trail proved
+            // the buffer reached `_streamArchitectTurn` empty — the
+            // reasoning was already lost upstream of that point).
+            final reasoning =
+                (msg['reasoning_content'] is String &&
+                    (msg['reasoning_content'] as String).isNotEmpty)
+                ? msg['reasoning_content'] as String
+                : (msg['reasoning'] is String &&
+                      (msg['reasoning'] as String).isNotEmpty)
+                ? msg['reasoning'] as String
+                : null;
+            if (reasoning != null) {
+              logBuf?.write('<think>$reasoning</think>');
+              yield '<think>$reasoning</think>';
+            }
+            final content = msg['content'];
+            if (content is String && content.isNotEmpty) {
+              logBuf?.write(content);
+              yield content;
+            }
+          }
+          // Wave BY: surface finish_reason from the one-shot path too
+          // so callers can discriminate clean stops from truncation
+          // regardless of which streaming mode the provider used.
+          final fr = choices[0]['finish_reason'];
+          if (fr is String && fr.isNotEmpty) {
+            logFinishReason = fr;
+            yield '$pyreFinishSentinelOpen$fr$pyreFinishSentinelClose';
+          }
+        }
+      } catch (e) {
+        throw ChatApiError(
+          'Non-SSE response and JSON parse failed: $e\n\nBody:\n${scrubProviderBody(jsonBody, apiKey: provider.apiKey)}',
+        );
+      }
+      return;
+    }
+
+    // SSE path. Some chunks may contain `delta.content` (visible
+    // tokens), others reasoning tokens. We emit both, wrapping
+    // reasoning in <think> tags so the existing ChatText filter can
+    // hide it by default.
+    //
+    // Wave BT: providers disagree on the reasoning field name —
+    //   - DeepSeek native / R1-style: `delta.reasoning_content`
+    //   - OpenRouter (normalized): `delta.reasoning`
+    //   - Some Qwen routes: also `delta.reasoning`
+    // Read both. Without this fallback the OpenRouter→DeepSeek V4 Pro
+    // route streamed all reasoning into `delta.reasoning` which we
+    // dropped, leaving the caller with an empty response and triggering
+    // the Wave BR no-stop fallback in a loop. The user's Wave BS trail
+    // pinpointed this exact failure mode.
+    // Wave CY.18.6: inter-chunk idle timeout. Once headers arrived
+    // and the SSE stream is open, the model needs time to produce
+    // the first chunk (reasoning models think for a while) — but
+    // after THAT first chunk, gaps of 45s mean the stream is dead.
+    // The .timeout() Stream extension applies a sliding window to
+    // EACH expected event, so the first window covers "headers → first
+    // chunk" (reasoning latency) and subsequent windows cover gaps
+    // between chunks. 45s is roomy enough for any sane reasoning model
+    // and tight enough to surface real stalls before the user gives up.
+    // Wave CY.18.120: local servers get a longer inter-chunk window too —
+    // a cold model can have a long gap between the headers and the first
+    // token even after the connection opens; hosted providers keep 45s.
+    final lines = resp.stream
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .timeout(
+          provider.kind == ProviderKind.localhost
+              ? _kLocalStreamStallTimeout
+              : const Duration(seconds: 45),
+          onTimeout: (sink) {
+            sink.addError(
+              ChatApiError(
+                'Stream stalled — no data from the server for a while. '
+                'The connection is open but the model has stopped responding.',
+              ),
+            );
+            sink.close();
+          },
+        );
+    var openedThink = false;
+    // Wave BY: capture finish_reason as it arrives — last non-null
+    // value wins. The OpenAI spec puts it on the final SSE delta
+    // (where content is empty); some providers emit it on multiple
+    // chunks. Streaming completes via [DONE] or end-of-stream.
+    String? capturedFinishReason;
+    // Wave CY.18.42: count frames we couldn't parse instead of
+    // swallowing them silently. A single dropped frame is harmless
+    // SSE noise (keepalive comment, stray whitespace, etc.) but
+    // dozens of them mean the model's actual content is going to
+    // /dev/null without any user-visible signal. We emit the count
+    // as a sentinel at stream end so the caller can render a
+    // "stream had N parse errors" warning.
+    var droppedFrames = 0;
+    Object? lastDropError;
+    await for (final line in lines) {
+      if (line.isEmpty) continue;
+      if (!line.startsWith('data:')) continue;
+      final payload = line.substring(5).trim();
+      if (payload == '[DONE]') break;
+      try {
+        final obj = jsonDecode(payload);
+        final choices = obj['choices'];
+        if (choices is List && choices.isNotEmpty) {
+          // Wave BY: finish_reason sits on the choice (sibling of
+          // `delta`), not inside it. Capture every non-null value;
+          // the model emits it on the final chunk for clean stops
+          // and on the same chunk as the truncation for length cuts.
+          final fr = choices[0]['finish_reason'];
+          if (fr is String && fr.isNotEmpty) {
+            capturedFinishReason = fr;
+          }
+          final delta = choices[0]['delta'];
+          if (delta is Map) {
+            // Try both field names — prefer `reasoning_content` (more
+            // explicit / DeepSeek-native) and fall back to `reasoning`
+            // (OpenRouter-normalized).
+            // Mega-audit 2026-06-04 (F9): OpenRouter's newer streaming shape
+            // is `delta.reasoning_details: [...]` (an array of typed parts).
+            // Routes that emit ONLY the array would drop the reasoning channel
+            // entirely (the same family as the Wave BT empty-content bug), so
+            // read it as a third fallback after the two flat fields.
+            final rcRaw = delta['reasoning_content'];
+            final rRaw = delta['reasoning'];
+            final reasoning = (rcRaw is String && rcRaw.isNotEmpty)
+                ? rcRaw
+                : (rRaw is String && rRaw.isNotEmpty)
+                ? rRaw
+                : extractReasoningDetailsText(delta['reasoning_details']);
+            if (reasoning != null) {
+              if (!openedThink) {
+                logBuf?.write('<think>');
+                yield '<think>';
+                openedThink = true;
+              }
+              logBuf?.write(reasoning);
+              yield reasoning;
+            }
+            final piece = delta['content'];
+            if (piece is String && piece.isNotEmpty) {
+              if (openedThink) {
+                logBuf?.write('</think>');
+                yield '</think>';
+                openedThink = false;
+              }
+              logBuf?.write(piece);
+              yield piece;
+            }
+          }
+        }
+      } catch (e) {
+        // Wave CY.18.42: keep streaming, but count the failure so we
+        // can surface it at end-of-stream. A frame we couldn't parse
+        // is a frame whose content the user never sees — historically
+        // (Wave BT debugging) this is exactly the kind of failure
+        // that produced empty assistant turns + retry loops without
+        // any in-app diagnostic. The last error is preserved to
+        // include in the sentinel for triage.
+        droppedFrames += 1;
+        lastDropError = e;
+      }
+    }
+    if (openedThink) {
+      // Stream ended mid-reasoning (model never produced visible
+      // content). Close the tag so the regex in ChatText can hide it.
+      yield '</think>';
+    }
+    // Wave CY.18.42: emit dropped-frame count BEFORE the finish_reason
+    // sentinel so the caller can render both. The sanitiser strips it
+    // alongside the other Pyre sentinels (see pyreDroppedFramesRegex).
+    if (droppedFrames > 0) {
+      // ignore: avoid_print
+      // Include the last error type in the sentinel so the user
+      // can tell "120 keepalive blanks" from "120 JSON parse fails".
+      final errKind = lastDropError == null
+          ? 'unknown'
+          : lastDropError.runtimeType.toString();
+      yield '$pyreDroppedFramesSentinelOpen$droppedFrames:$errKind$pyreDroppedFramesSentinelClose';
+    }
+    // Wave BY: emit the captured finish_reason as a sentinel chunk so
+    // the caller can discriminate `stop` (clean — server cut on our
+    // stop sequence OR model emitted EOS) from `length` (truncated by
+    // max_tokens). The sanitiser strips this marker before display so
+    // it never leaks into the brief.
+    if (capturedFinishReason != null) {
+      logFinishReason = capturedFinishReason;
+      yield '$pyreFinishSentinelOpen$capturedFinishReason$pyreFinishSentinelClose';
+    }
+  } finally {
+    client.close();
+    // Wave CY.18.214: write the diagnostics record exactly once, AFTER the
+    // stream finishes for any reason (clean end, early return, thrown
+    // error, or the consumer cancelling the subscription). `finally` in a
+    // generator runs on all of those, and emitDebugRecord is itself
+    // idempotent + swallows its own errors, so this never affects the
+    // generation. No-op when the log is off / untagged.
+    emitDebugRecord();
+  }
+}
+
+/// Wave BY: sentinels that wrap a finish_reason value emitted at
+/// stream end. The strings are deliberately ugly so they won't
+/// collide with anything a model might naturally emit; the caller
+/// scans for them in the buffer and strips them before display.
+/// Format: `<<__PYRE_FINISH__:length__>>` or `<<__PYRE_FINISH__:stop__>>`.
+const String pyreFinishSentinelOpen = '<<__PYRE_FINISH__:';
+const String pyreFinishSentinelClose = '__>>';
+
+/// Wave BY: regex that matches the finish-reason sentinel in a buffer
+/// and exposes its `value` capture group. Used by the sanitiser to
+/// strip the sentinel before rendering, and by callers that want to
+/// read the captured reason.
+final RegExp pyreFinishSentinelRegex = RegExp(
+  r'<<__PYRE_FINISH__:([a-z_]+)__>>',
+  caseSensitive: false,
+);
+
+/// Wave CY.18.42: dropped-frame sentinel. Emitted at end-of-stream
+/// when one or more SSE frames couldn't be parsed. Format:
+/// `<<__PYRE_DROPPED__:42:FormatException__>>` — count then error
+/// type, colon-separated. The sanitiser strips it; callers that want
+/// to surface a warning extract count + kind via the regex.
+const String pyreDroppedFramesSentinelOpen = '<<__PYRE_DROPPED__:';
+const String pyreDroppedFramesSentinelClose = '__>>';
+
+/// Matches the dropped-frames sentinel. Capture 1 is count, capture 2
+/// is the runtime type of the last drop error.
+final RegExp pyreDroppedFramesRegex = RegExp(
+  r'<<__PYRE_DROPPED__:(\d+):([A-Za-z_][A-Za-z0-9_]*)__>>',
+  caseSensitive: false,
+);
+
+/// One-shot (non-streamed) completion. Returns the full assistant text.
+/// [stop] mirrors the streaming variant — see [streamChatCompletion].
+Future<String> completeChat({
+  required ApiProvider provider,
+  required ModelSettings settings,
+  required List<ChatTurn> messages,
+  Preset? preset,
+  List<String>? stop,
+  // Wave CY.18.214: opt-in diagnostics tag (e.g. `creator-vision`). The
+  // one-shot path is a DIFFERENT transport from streamChatCompletion, so
+  // it carries its own capture point. KEY-FREE: the body below holds no
+  // apiKey (it rides the Authorization header). Strict no-op when off.
+  String? debugTag,
+  // Wave CY.18.236: extra top-level request-body fields (e.g.
+  // `response_format` for the structured Creator build), spread LAST so they
+  // override a stale `provider.extraParams` entry. Null for all existing
+  // callers → byte-identical body. The structured build prefers this
+  // NON-streaming path: a reasoning model (DeepSeek-v4-pro) can think for far
+  // longer than the streaming inter-chunk stall window before emitting its
+  // first content token, which intermittently aborts the stream to empty;
+  // one-shot waits for the whole response instead.
+  Map<String, dynamic>? extraBody,
+}) async {
+  if (provider.baseUrl.isEmpty) {
+    throw ChatApiError('Provider has no baseUrl configured');
+  }
+  // Pyre 1.1.3: native Anthropic one-shot path (debugTag / extraBody are
+  // OpenAI-specific and not threaded into the Anthropic dialect).
+  if (provider.format == ApiFormat.anthropic) {
+    return _completeAnthropic(
+      provider: provider,
+      settings: settings,
+      messages: messages,
+      preset: preset,
+      stop: stop,
+    );
+  }
+  final url = Uri.parse(buildChatUrl(provider.baseUrl, 'chat/completions'));
+  // Wave CY.18.214: build the body once so the diagnostics hook can log
+  // the exact request (key-free). Guard so it's a strict no-op when off.
+  final bool shouldLog = debugTag != null && LlmDebugLog.instance.enabled;
+  final Stopwatch? logSw = shouldLog ? (Stopwatch()..start()) : null;
+  // Wave CY.18.267: same reshape as the streaming path (buildRequestBody), so
+  // the one-shot transport honours the provider's format too. `none` (default)
+  // is a no-op → byte-identical body.
+  final processed = applyPromptPostProcessing(
+    messages,
+    provider.promptPostProcessing,
+  );
+  // Mega-audit 2026-06-04: `reqBody` is non-final so the universal param-error
+  // retry below can swap in the minimal-safe body; the diagnostics closure
+  // captures it by reference and logs whichever body actually ran.
+  // `safeBodyFor` proactively drops/renames the fields strict providers
+  // (OpenAI reasoning, Mistral) reject; permissive providers get the same map
+  // back unchanged.
+  var reqBody = safeBodyFor(provider, provider.model, <String, dynamic>{
+    ...provider.extraParams,
+    'model': provider.model,
+    'messages': processed.map((m) => m.toJson()).toList(),
+    ..._samplingPayload(settings, preset),
+    if (stop != null && stop.isNotEmpty) 'stop': stop,
+    'stream': false,
+    ...?extraBody,
+  });
+  void emitDebugRecord({
+    required String response,
+    String? finishReason,
+    String? parseOutcome,
+  }) {
+    if (!shouldLog) return;
+    try {
+      LlmDebugLog.instance.record(
+        LlmCallRecord(
+          ts: DateTime.now().millisecondsSinceEpoch,
+          feature: debugTag,
+          provider: provider.name,
+          model: provider.model,
+          messages: (reqBody['messages'] as List?) ?? const <dynamic>[],
+          sampling: <String, dynamic>{
+            for (final e in reqBody.entries)
+              if (e.key != 'messages') e.key: e.value,
+          },
+          response: response,
+          finishReason: finishReason,
+          durationMs: logSw?.elapsedMilliseconds ?? 0,
+          parseOutcome: parseOutcome,
+        ),
+      );
+    } catch (_) {
+      // Never let diagnostics break a generation.
+    }
+  }
+
+  // Wave CY.18.6: hard timeout on the one-shot completion. Used by
+  // the long-term memory summariser (fire-and-forget after each
+  // message). 75s covers a slow reasoning model writing a 2-3
+  // paragraph recap with plenty of margin; a hang past that is the
+  // server being broken, not "still thinking".
+  // Wave CY.18.45: classify offline / DNS / timeout vs server errors —
+  // see the matching wrapper in the streaming path. The one-shot route
+  // is used by the memory summariser fire-and-forget; without this an
+  // offline auto-summarise leaks `SocketException: Failed host lookup`
+  // into MemoryErrors.log and the user sees console-speak gibberish
+  // instead of a clean "looks like the device is offline" entry.
+  // POST the current `reqBody`. Called twice at most: normally, then once
+  // more on a param-error retry with the minimal-safe body.
+  Future<http.Response> post() => http
+      .post(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          if (provider.apiKey.isNotEmpty)
+            'Authorization': 'Bearer ${provider.apiKey}',
+          ..._sanitiseHeaders(provider.headers),
+        },
+        body: jsonEncode(reqBody),
+      )
+      .timeout(
+        // Wave CY.18.120: local servers get a 5-minute one-shot window for a
+        // cold model load; hosted providers keep the original 75s.
+        provider.kind == ProviderKind.localhost
+            ? _kLocalCompleteTimeout
+            : const Duration(seconds: 75),
+        onTimeout: () => throw ChatApiError.timeout(
+          'Request timed out. The model never produced a response (a local '
+          'server may still be loading the model).',
+        ),
+      );
+
+  http.Response resp;
+  try {
+    resp = await post();
+  } catch (e) {
+    // Wave CY.18.214: record the failed call (empty response + the error
+    // as the parse outcome) before rethrowing, so the diagnostics log
+    // shows attempts that never produced a body too.
+    final classified = _classifyNetworkError(e);
+    emitDebugRecord(response: '', parseOutcome: 'error: $classified');
+    throw classified;
+  }
+  if (resp.statusCode >= 400) {
+    final scrubbed = scrubProviderBody(resp.body, apiKey: provider.apiKey);
+    // Mega-audit 2026-06-04 (THE key fix): universal retry-without-extras on a
+    // parameter-shape 4xx. Rebuild with the minimal safe set (model, messages,
+    // stream, token cap under both names) and retry EXACTLY ONCE so strict
+    // providers (OpenAI reasoning, Mistral, …) fail soft. Terminates — a
+    // second failure throws.
+    if (resp.statusCode < 500 && isUnsupportedParamError(scrubbed)) {
+      reqBody = minimalRetryBody(reqBody);
+      try {
+        resp = await post();
+      } catch (e) {
+        final classified = _classifyNetworkError(e);
+        emitDebugRecord(response: '', parseOutcome: 'error: $classified');
+        throw classified;
+      }
+      if (resp.statusCode >= 400) {
+        emitDebugRecord(response: '', parseOutcome: 'http ${resp.statusCode}');
+        throw ChatApiError(
+          scrubProviderBody(resp.body, apiKey: provider.apiKey),
+          statusCode: resp.statusCode,
+        );
+      }
+    } else {
+      emitDebugRecord(response: '', parseOutcome: 'http ${resp.statusCode}');
+      throw ChatApiError(scrubbed, statusCode: resp.statusCode);
+    }
+  }
+  final obj = jsonDecode(resp.body);
+  final choices = obj['choices'];
+  if (choices is List && choices.isNotEmpty) {
+    final msg = choices[0]['message'];
+    final fr = choices[0]['finish_reason'];
+    if (msg is Map) {
+      final text = extractCompletionMessageText(msg);
+      emitDebugRecord(
+        response: text,
+        finishReason: fr is String && fr.isNotEmpty ? fr : null,
+      );
+      return text;
+    }
+  }
+  emitDebugRecord(response: '', parseOutcome: 'no choices');
+  return '';
+}
+
+/// Wave CY.18.160: run a chat completion to completion over the STREAMING
+/// transport and return the full assembled text, with Pyre's internal
+/// stream sentinels + reasoning stripped.
+///
+/// WHY a second "complete" entry point: the long-term-memory summariser
+/// used the one-shot [completeChat] (`stream:false`). That request shape
+/// is a DIFFERENT code path from the live chat (which always streams), and
+/// some providers handle it differently — Chub/Soji in particular returned
+/// nothing usable on `stream:false`, so the summariser silently produced no
+/// checkpoint while the chat itself worked fine. This variant reuses the
+/// EXACT [streamChatCompletion] transport the chat uses, so it succeeds on
+/// every provider the chat succeeds on, and inherits its JSON-fallback,
+/// reasoning handling, web/LAN-proxy routing, and timeouts for free.
+Future<String> completeChatStreamed({
+  required ApiProvider provider,
+  required ModelSettings settings,
+  required List<ChatTurn> messages,
+  List<String>? stop,
+  // Wave CY.18.214: threaded straight through to streamChatCompletion,
+  // which owns the single capture point. Logging this variant here too
+  // would double-record, so we DON'T — the underlying stream records once.
+  String? debugTag,
+  // Forwarded to streamChatCompletion (structured-output `response_format`).
+  Map<String, dynamic>? extraBody,
+  // Optional out-sink for the REASONING-INCLUSIVE text: the same accumulated
+  // stream with Pyre's internal sentinels stripped but the `<think>…</think>`
+  // reasoning channel PRESERVED. The normal return value still strips
+  // reasoning. The Creator's structured build uses this to recover a JSON
+  // object that a reasoning model emitted in its reasoning channel (so
+  // `content` — and thus the return value — comes back empty). Null = no-op,
+  // so every other caller is byte-identical.
+  StringBuffer? rawSink,
+  // Wave CY.18.270: when the stripped visible content is EMPTY, fall back to
+  // the reasoning channel's text (via [recoverReasoningFromRaw]). Mirrors the
+  // one-shot [extractCompletionMessageText] fallback so the LTM summariser
+  // gets a usable recap from a reasoning model that emits its whole answer in
+  // the `<think>` channel instead of silently producing no checkpoint.
+  // Default false ⇒ no behaviour change for the chat path and every other
+  // existing caller (visible content always wins; reasoning is fallback-only).
+  bool allowReasoningFallback = false,
+  // BLOCKER 1: forwarded to streamChatCompletion — fires when this call fell
+  // back to the minimal body because the provider rejected an extra param
+  // (the Creator build's `response_format`). Null = no-op.
+  void Function()? onParamFallback,
+}) async {
+  final buf = StringBuffer();
+  await for (final chunk in streamChatCompletion(
+    provider: provider,
+    settings: settings,
+    messages: messages,
+    stop: stop,
+    debugTag: debugTag,
+    extraBody: extraBody,
+    onParamFallback: onParamFallback,
+  )) {
+    buf.write(chunk);
+  }
+  final raw = buf.toString();
+  if (rawSink != null) {
+    // Strip only the Pyre sentinels — keep `<think>` so the build can scan the
+    // reasoning channel for a JSON object the model put there.
+    rawSink.write(
+      raw
+          .replaceAll(pyreFinishSentinelRegex, '')
+          .replaceAll(pyreDroppedFramesRegex, ''),
+    );
+  }
+  final stripped = stripStreamArtifacts(raw);
+  // Wave CY.18.270: visible content wins; only when it's empty AND the caller
+  // opted in do we recover the reasoning channel (the LTM summariser does, so
+  // a reasoning-only model still yields a usable recap instead of nothing).
+  if (stripped.isEmpty && allowReasoningFallback) {
+    final recovered = recoverReasoningFromRaw(raw);
+    if (recovered != null && recovered.isNotEmpty) return recovered;
+  }
+  return stripped;
+}
+
+/// Strip Pyre's internal streaming sentinels (finish-reason, dropped-frame)
+/// and any `<think>…</think>` reasoning from accumulated stream text,
+/// leaving just the model's prose. Pure + testable.
+String stripStreamArtifacts(String raw) => _stripThinkBlocks(
+  raw
+      .replaceAll(pyreFinishSentinelRegex, '')
+      .replaceAll(pyreDroppedFramesRegex, ''),
+);
+
+/// Wave CY.18.270: recover the REASONING-channel text from an accumulated
+/// stream when the visible/stripped content came back empty. The streaming
+/// transport wraps reasoning tokens (`delta.reasoning` / `reasoning_content`)
+/// in `<think>…</think>` (see the SSE + JSON-fallback branches above); for a
+/// reasoning model that emits its WHOLE answer in the reasoning channel
+/// (Venice's uncensored Qwen, DeepSeek-R1, …) [stripStreamArtifacts] returns
+/// '' and the LTM summariser silently produced no checkpoint.
+///
+/// This is the STREAMING-path twin of [extractCompletionMessageText]'s
+/// reasoning fallback, and mirrors its precedence: callers use the stripped
+/// visible content FIRST and only fall back to this when that is empty.
+///
+/// Returns the inner text of the FIRST `<think>…</think>` block (Pyre
+/// sentinels removed, any nested tags stripped, trimmed), or null when there
+/// is no usable reasoning text. Pure + testable.
+String? recoverReasoningFromRaw(String raw) {
+  final cleaned = raw
+      .replaceAll(pyreFinishSentinelRegex, '')
+      .replaceAll(pyreDroppedFramesRegex, '');
+  final match = _completionThinkBlock.firstMatch(cleaned);
+  if (match == null) return null;
+  // Inner text of `<think>…</think>` with any nested tags stripped.
+  var inner = match
+      .group(0)!
+      .replaceAll(RegExp(r'^<think>', caseSensitive: false), '')
+      .replaceAll(RegExp(r'</think>$', caseSensitive: false), '')
+      .replaceAll(RegExp(r'</?think>', caseSensitive: false), '')
+      .trim();
+  return inner.isEmpty ? null : inner;
+}
+
+// Regexes for the one-shot completion text extraction. Mirror
+// ChatText.stripReasoning (widgets/chat_text.dart) but live here so the
+// service layer doesn't import Flutter material. Kept in sync deliberately.
+final RegExp _completionThinkBlock = RegExp(
+  r'<think>[\s\S]*?</think>',
+  caseSensitive: false,
+  multiLine: true,
+);
+final RegExp _completionDanglingThink = RegExp(
+  r'<think>[\s\S]*$',
+  caseSensitive: false,
+  multiLine: true,
+);
+
+/// Strip every complete `<think>…</think>` block plus a dangling open tail
+/// from a one-shot completion. Pure; mirrors ChatText.stripReasoning.
+String _stripThinkBlocks(String body) => body
+    .replaceAll(_completionThinkBlock, '')
+    .replaceAll(_completionDanglingThink, '')
+    .trim();
+
+/// Wave CY.18.160: extract usable text from a non-streaming
+/// `choices[0].message`, reasoning-aware.
+///
+/// The streaming path (the SSE / JSON-fallback branch above) already reads
+/// the reasoning channel — `reasoning_content` (DeepSeek/R1) or `reasoning`
+/// (OpenRouter / some Qwen routes) — but the one-shot `completeChat` only
+/// ever read `content`. For a reasoning model that spends its token budget
+/// in the reasoning channel (e.g. Venice's uncensored Qwen, whose
+/// uncensoring rides ON the reasoning phase) `content` comes back EMPTY,
+/// so the LTM auto-summariser (which calls completeChat) silently got ''
+/// → "empty summary" → null checkpoint → nothing ever fired. Vision
+/// (`describeCharacterImage`) hit the same blind spot.
+///
+/// Strategy:
+///  1. Prefer `content` with any inline `<think>…</think>` stripped.
+///  2. If that's empty, fall back to the reasoning channel (also
+///     think-stripped) so callers get SOMETHING instead of failing
+///     silently. The summary is internal context, not shown verbatim, so a
+///     slightly "thinky" recap beats no recap at all.
+String extractCompletionMessageText(Map msg) {
+  final content = msg['content'];
+  if (content is String) {
+    final clean = _stripThinkBlocks(content);
+    if (clean.isNotEmpty) return clean;
+  }
+  // Reasoning-only fallback. Same field precedence as the streaming branch:
+  // prefer `reasoning_content`, then `reasoning`.
+  final reasoning =
+      (msg['reasoning_content'] is String &&
+          (msg['reasoning_content'] as String).trim().isNotEmpty)
+      ? msg['reasoning_content'] as String
+      : (msg['reasoning'] is String &&
+            (msg['reasoning'] as String).trim().isNotEmpty)
+      ? msg['reasoning'] as String
+      : '';
+  return _stripThinkBlocks(reasoning);
+}
+
+/// Wave CY.18.120: fire a minimal completion to make a local server
+/// (LM Studio / Ollama) JIT-load [provider.model] BEFORE the user's
+/// first real request — otherwise the cold load blocks long enough to
+/// time the first request out. Best-effort + fire-and-forget: every
+/// error is swallowed (a failed warm-up just means the first real
+/// request pays the cold-load cost). Long timeout so the socket stays
+/// open through a slow load. No-op when baseUrl or model is empty.
+Future<void> warmUpProvider(ApiProvider provider) async {
+  // Nothing to load if we don't know where to send the request or which
+  // model to ask for (e.g. a half-filled provider row).
+  if (provider.baseUrl.trim().isEmpty || provider.model.trim().isEmpty) {
+    return;
+  }
+  // Mega-audit 2026-06-05 (H-7): this fires UNATTENDED at launch / on save,
+  // so it's the highest-risk SSRF surface. Refuse to auto-warm an
+  // External/proxy provider whose URL points at a private/internal host —
+  // a synced or imported record could otherwise make the app probe an
+  // attacker-chosen internal address with no user action. The explicit
+  // localhost kind (LM Studio/Ollama) is exempt: reaching a local/LAN
+  // server is its entire purpose.
+  if (!isProviderHostAllowed(
+    provider.baseUrl,
+    isLocalhostKind: provider.kind == ProviderKind.localhost,
+  )) {
+    debugPrint(
+      'warmUpProvider(${provider.name}) skipped: '
+      'non-localhost provider points at a private/internal host',
+    );
+    return;
+  }
+  try {
+    final url = Uri.parse(buildChatUrl(provider.baseUrl, 'chat/completions'));
+    // Same URL/header shape as completeChat so the request is
+    // indistinguishable from a real one to the server.
+    await http
+        .post(
+          url,
+          headers: {
+            'Content-Type': 'application/json',
+            if (provider.apiKey.isNotEmpty)
+              'Authorization': 'Bearer ${provider.apiKey}',
+            ..._sanitiseHeaders(provider.headers),
+          },
+          // Tiny body: one user turn + max_tokens 1 so the server does the
+          // expensive part (loading weights into RAM/VRAM) but barely any
+          // generation. extraParams first so Pyre-managed fields win.
+          body: jsonEncode({
+            ...provider.extraParams,
+            'model': provider.model,
+            'messages': [
+              {'role': 'user', 'content': 'hi'},
+            ],
+            'max_tokens': 1,
+            'stream': false,
+          }),
+        )
+        .timeout(const Duration(seconds: 300));
+  } catch (e) {
+    // Swallow EVERYTHING — warm-up is purely an optimisation. A failure
+    // (offline, model name typo, server not up yet) is harmless: the
+    // first real request just eats the cold-load cost as it did before.
+    debugPrint('warmUpProvider(${provider.name}) skipped: $e');
+  }
+}
+
+/// Strip any header whose name or value contains CR/LF — those characters
+/// allow HTTP header injection (smuggling a second header / starting an
+/// early response body). Dart's `http` package already validates header
+/// values on send, but defending in depth in our own code lets the UI
+/// give nicer feedback (we just silently drop the entry).
+Map<String, String> _sanitiseHeaders(Map<String, String> headers) {
+  final out = <String, String>{};
+  headers.forEach((k, v) {
+    if (k.contains('\r') || k.contains('\n')) return;
+    if (v.contains('\r') || v.contains('\n')) return;
+    if (k.isEmpty) return;
+    out[k] = v;
+  });
+  return out;
+}
+
+String _trimSlash(String s) =>
+    s.endsWith('/') ? s.substring(0, s.length - 1) : s;
+
+/// Compose an OpenAI-compatible endpoint URL while honouring whatever
+/// version segment the user already pasted into the base URL.
+///
+/// Many providers document their base WITH `/v1` already in it
+/// (e.g. `https://mars.chub.ai/chub/soji/v1`, `https://openrouter.ai/api/v1`),
+/// while others document it WITHOUT (e.g. `https://api.openai.com`). Naively
+/// appending `/v1/<path>` produces a `/v1/v1/…` 404 on the former group.
+///
+/// Rule:
+///  • if the trimmed base already ends in `/v1` (or any `/v\d+`), append
+///    only the trailing path
+///  • otherwise add `/v1/` between base and path
+String buildChatUrl(String baseUrl, String path) {
+  final base = _trimSlash(baseUrl.trim());
+  final hasVersion = RegExp(r'/v\d+$').hasMatch(base);
+  final p = path.startsWith('/') ? path.substring(1) : path;
+  return hasVersion ? '$base/$p' : '$base/v1/$p';
+}
+
+/// Wave CY.18.71: web/PWA path — proxy the chat through the paired
+/// desktop's `/llm/stream` endpoint instead of calling the LLM
+/// upstream directly. The desktop uses ITS own SecureKeys-stored
+/// API key, so the browser never sees credentials. Server response
+/// is SSE (`data: <chunk>\n\n` + `data: [DONE]`); we decode + reverse
+/// the newline escape applied server-side.
+Stream<String> _streamViaLanProxy({
+  required ApiProvider provider,
+  required List<ChatTurn> messages,
+  List<String>? stop,
+}) async* {
+  final lan = LanClient.instance;
+  final baseUrl = lan.baseUrl;
+  final bearer = lan.bearerToken;
+  if (baseUrl == null || bearer == null) {
+    throw ChatApiError('LAN client not paired — open More > Connect to LAN.');
+  }
+  final body = jsonEncode({
+    // 1.1.2: deliberately DON'T send a providerId. The web client's local
+    // provider list is separate from the host's, so its id would never match
+    // the host's active provider → the host 403s it ("provider not permitted").
+    // Omitting it makes the host proxy with its OWN active provider, which is
+    // also exactly the budget-drain guard the host wants (a paired device can
+    // only ever use the host's active provider, never pick an expensive one).
+    'messages': messages.map(lanProxyMessageJson).toList(),
+    if (stop != null && stop.isNotEmpty) 'stop': stop,
+  });
+  final req = http.Request('POST', Uri.parse('$baseUrl/llm/stream'));
+  req.headers.addAll({
+    'authorization': 'Bearer $bearer',
+    'content-type': 'application/json',
+    'accept': 'text/event-stream',
+  });
+  req.body = body;
+  // Web: a Fetch-API client that delivers the SSE body incrementally — the
+  // default BrowserClient (XHR) buffers the whole response, so token streaming
+  // never streamed on web. Native: a plain client (IOClient streams already).
+  final httpClient = makeStreamingClient();
+  try {
+    // Kind-aware connect timeout, matching the native path. When the paired
+    // desktop is proxying a LOCAL model (localhost provider), the upstream
+    // server can JIT-load weights for minutes before the desktop forwards
+    // any bytes — a hard 25s would abort the proxy mid-load. Cloud-backed
+    // providers keep the tight 25s window.
+    final resp = await httpClient
+        .send(req)
+        .timeout(
+          provider.kind == ProviderKind.localhost
+              ? _kLocalConnectTimeout
+              : const Duration(seconds: 25),
+          onTimeout: () {
+            throw ChatApiError(
+              'LAN proxy timeout - is the PC server still running?',
+            );
+          },
+        );
+    if (resp.statusCode == 401) {
+      throw ChatApiError(
+        'LAN bearer revoked - re-pair from More > Connect to LAN.',
+      );
+    }
+    if (resp.statusCode != 200) {
+      final errBody = await resp.stream.bytesToString();
+      throw ChatApiError('LAN proxy HTTP ${resp.statusCode}: $errBody');
+    }
+    // SSE buffering. Events are separated by blank line; within each
+    // event a `data:` line carries the chunk. `event: error` signals
+    // an upstream LLM failure the server forwarded.
+    final buf = StringBuffer();
+    // Audit 2026-06-04 (High): inter-chunk stall timeout. The connect above is
+    // bounded, but a server that stalls AFTER headers (dead upstream worker,
+    // hung proxy) would otherwise leave the web/PWA chat on "Generating…"
+    // forever with no error + no Retry. The native SSE path already guards this
+    // with the same kind-aware stall timeout; mirror it here.
+    final stall = provider.kind == ProviderKind.localhost
+        ? _kLocalStreamStallTimeout
+        : const Duration(seconds: 45);
+    await for (final chunk
+        in resp.stream
+            .transform(utf8.decoder)
+            .timeout(
+              stall,
+              onTimeout: (sink) {
+                sink.addError(
+                  ChatApiError(
+                    'LAN proxy stalled - no data from the PC server. It may have lost '
+                    'its upstream connection.',
+                  ),
+                );
+              },
+            )) {
+      buf.write(chunk);
+      while (true) {
+        final s = buf.toString();
+        final sep = s.indexOf('\n\n');
+        if (sep < 0) break;
+        final event = s.substring(0, sep);
+        buf
+          ..clear()
+          ..write(s.substring(sep + 2));
+        String? data;
+        String? eventName;
+        for (final line in event.split('\n')) {
+          if (line.startsWith('data:')) {
+            data = sseDataPayload(line);
+          } else if (line.startsWith('event:')) {
+            eventName = line.substring(6).trim();
+          }
+        }
+        if (data == null) continue;
+        if (eventName == 'error') {
+          throw ChatApiError('Upstream error via LAN proxy: $data');
+        }
+        if (data == '[DONE]') return;
+        yield _unescapeSseChunk(data);
+      }
+    }
+  } finally {
+    httpClient.close();
+  }
+}
+
+/// Extract the payload from an SSE `data:` line, stripping ONLY the single
+/// optional separator space right after the colon (per the SSE spec) — NOT all
+/// leading whitespace. The old `substring(5).trimLeft()` ate a token's OWN
+/// leading space (e.g. " world"), running words together on the web LAN-proxy
+/// path ("Hello"+"world" → "Helloworld"). Top-level + pure → unit-testable.
+String sseDataPayload(String dataLine) {
+  var d = dataLine.substring(5); // drop the "data:" prefix
+  if (d.startsWith(' ')) d = d.substring(1); // drop the ONE SSE separator space
+  return d;
+}
+
+/// Reverse the server-side escape applied in pyre_server.dart
+/// `_escapeForSse`. We walk the string once, expanding each `\X`
+/// escape sequence we recognise. Unrecognised `\X` passes through
+/// verbatim.
+String _unescapeSseChunk(String s) {
+  final out = StringBuffer();
+  for (var i = 0; i < s.length; i++) {
+    final c = s[i];
+    if (c == '\\' && i + 1 < s.length) {
+      final next = s[i + 1];
+      if (next == 'n') {
+        out.write('\n');
+        i++;
+        continue;
+      }
+      if (next == 'r') {
+        out.write('\r');
+        i++;
+        continue;
+      }
+      if (next == '\\') {
+        out.write('\\');
+        i++;
+        continue;
+      }
+    }
+    out.write(c);
+  }
+  return out.toString();
+}

@@ -1,0 +1,152 @@
+// Facilidade (owner 2026-07): create a GROUP chat in one flow. Covers the
+// multi-select GroupCharacterPickerScreen — the primary is locked on and the
+// popped id list preserves selection order (primary first), which becomes the
+// member order of the created chat.
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:provider/provider.dart';
+
+import 'package:pyre/models/models.dart';
+import 'package:pyre/screens/chat_picker_screens.dart';
+import 'package:pyre/services/store_backend.dart';
+import 'package:pyre/state/app_store.dart';
+
+class _NoopBackend implements StoreBackend {
+  @override
+  Future<Map<String, dynamic>?> load() async => null;
+  @override
+  Future<void> save(Map<String, dynamic> blob) async {}
+  @override
+  Future<void> clear() async {}
+}
+
+Character _char(String id, String name) => Character(
+    id: id, name: name, description: 'x', createdAt: 0, updatedAt: 0);
+
+void main() {
+  testWidgets(
+      'group picker: primary locked on, popped list preserves order '
+      '(primary first)', (tester) async {
+    final store = AppStore(storage: _NoopBackend());
+    final a = _char('ca', 'Sera');
+    final b = _char('cb', 'Talia');
+    final c = _char('cc', 'Orin');
+    store.characters.addAll([a, b, c]);
+
+    GroupChatPick? popped;
+    await tester.pumpWidget(ChangeNotifierProvider<AppStore>.value(
+      value: store,
+      child: MaterialApp(
+        home: Builder(
+          builder: (context) => ElevatedButton(
+            onPressed: () async {
+              popped = await Navigator.of(context).push<GroupChatPick>(
+                MaterialPageRoute(
+                  builder: (_) => GroupCharacterPickerScreen(primary: a),
+                ),
+              );
+            },
+            child: const Text('open'),
+          ),
+        ),
+      ),
+    ));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+
+    // Primary row is locked (its checkbox has onChanged == null → disabled).
+    final primaryTile = tester.widget<CheckboxListTile>(
+      find.ancestor(
+        of: find.text('Sera'),
+        matching: find.byType(CheckboxListTile),
+      ),
+    );
+    expect(primaryTile.onChanged, isNull);
+    expect(primaryTile.value, isTrue);
+
+    // Select Orin THEN Talia — the popped order must reflect that.
+    await tester.tap(find.text('Orin'));
+    await tester.pump();
+    await tester.tap(find.text('Talia'));
+    await tester.pump();
+    expect(find.text('3 members'), findsOneWidget);
+
+    await tester.tap(find.text('Create chat'));
+    await tester.pumpAndSettle();
+
+    expect(popped?.memberIds, ['ca', 'cc', 'cb']); // primary first, then tap order
+    // 2026-07-05 (Gui): Party mode is chosen in the picker — defaults ON.
+    expect(popped?.partyMode, isTrue);
+  });
+
+  testWidgets(
+      'REGRESSION: startNewGroupChat survives its launching sheet being '
+      'popped (the real call site pops the details sheet first)', (tester) async {
+    final store = AppStore(storage: _NoopBackend());
+    final a = _char('ca', 'Sera');
+    final b = _char('cb', 'Talia');
+    store.characters.addAll([a, b]);
+    // Skip the persona prompt so the flow is: picker → create → open chat.
+    store.chatSettings.askPersonaOnNewChat = false;
+
+    await tester.pumpWidget(ChangeNotifierProvider<AppStore>.value(
+      value: store,
+      child: MaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => ElevatedButton(
+              onPressed: () => showModalBottomSheet<void>(
+                context: context,
+                builder: (sheetCtx) => ElevatedButton(
+                  // EXACT shape of character_details_sheet's onStartGroupChat:
+                  // pop the sheet, then start the flow from the sheet's own
+                  // (now dying) context.
+                  onPressed: () {
+                    Navigator.of(sheetCtx).pop();
+                    startNewGroupChat(sheetCtx, a);
+                  },
+                  child: const Text('group'),
+                ),
+              ),
+              child: const Text('open sheet'),
+            ),
+          ),
+        ),
+      ),
+    ));
+
+    await tester.tap(find.text('open sheet'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('group'));
+    await tester.pumpAndSettle(); // sheet pops + picker pushes
+
+    // The picker must be up (primary locked). Add Talia and create.
+    expect(find.text('New group chat'), findsOneWidget);
+    await tester.tap(find.text('Talia'));
+    await tester.pump();
+    await tester.tap(find.text('Create chat'));
+    await tester.pumpAndSettle();
+
+    // THE bug: with a dead context the flow silently bailed — no chat.
+    expect(store.chats.length, 1,
+        reason: 'the group chat must be created even though the launching '
+            'sheet was popped');
+    expect(store.chats.first.characterIds, ['ca', 'cb']);
+  });
+
+  testWidgets('group picker with just the primary reads as a 1:1 chat',
+      (tester) async {
+    final store = AppStore(storage: _NoopBackend());
+    final a = _char('ca', 'Sera');
+    store.characters.add(a);
+
+    await tester.pumpWidget(ChangeNotifierProvider<AppStore>.value(
+      value: store,
+      child: MaterialApp(home: GroupCharacterPickerScreen(primary: a)),
+    ));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('a regular 1:1 chat'), findsOneWidget);
+  });
+}

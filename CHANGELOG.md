@@ -1,0 +1,470 @@
+# Changelog
+
+All notable changes to Pyre are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and Pyre follows a leading-digit `MAJOR.MINOR.PATCH` version.
+
+## [1.2.0] - 2026-07-07
+
+The "group & party" release, plus a Creator that finally edits like you'd
+expect. Chat with a whole cast at once, be a group yourself, edit any part of
+a card in place (even cards not built in Pyre), and hand the Creator one of
+your own characters, personas, or lorebooks as a reference. On top of that: a
+rebuilt Checkpoints that summarises like chapters, per-preset prefill and
+sampler controls, and a broad polish and data-integrity pass.
+
+### Added
+
+- **Group chats.** Start a chat with several characters at once. The header
+  shows the whole cast (stacked avatars + names), and each member answers on
+  their own turn as before.
+- **Party mode.** In a group chat, turn Party mode on and the whole cast
+  answers together as one scene — a "Narrator" voices everyone at once instead
+  of one character at a time. Reply length scales with the number of members.
+- **Persona party.** The *user* side can be a group too. Pick several personas
+  for a chat and your messages speak for the whole group; Impersonate and Guide
+  are group-aware and write for every member, not just the first.
+- **Create groups from anywhere.** New chat → *Group chat* on the Chats tab,
+  or *Start group chat* from a character's menu / details. Pick the whole cast
+  (and Party mode, and your personas) up front instead of adding members one by
+  one after the fact.
+- **Creator — edit any part of a card in place.** Ask for a change and it edits
+  only what you named (a field, or even a single section of the Description),
+  leaving everything else — including your hand-written text — byte-for-byte
+  untouched.
+- **Creator — edit cards that aren't in Pyre's format.** Imported a card with a
+  free-form description? The Creator now makes surgical text edits to just the
+  part you asked about instead of refusing or rewriting the whole thing.
+- **Creator — edit a card and its bound lorebook in one session**, and
+  *Edit-with-AI* now updates lorebook entries in place.
+- **Creator knows good craft.** Each mode (character, scenario, persona,
+  lorebook) now carries a "what makes this good" doctrine, so the build reasons
+  from craft instead of filling blanks — and scenario/persona builds read the
+  vibe of what you asked for.
+- **Creator — attach a card, persona, or lorebook from your library** as a
+  reference, not only a file from your device. Great for "make a new character
+  in this style" or grounding a build in one of your worlds.
+- **Native gallery for images.** Attaching a reference image, avatars,
+  backgrounds and gallery photos now open your phone's photo gallery instead of
+  the file browser. (Card imports still use the file browser so embedded data
+  is preserved.)
+- **Checkpoints are chapters now.** Each checkpoint summarises only its own span
+  of the story and never re-tells what an earlier one already covered — so the
+  chain reads like chapters you can follow on their own. They also trigger more
+  honestly, and checkpoints from other branches surface with a banner instead of
+  silently vanishing.
+- **Prefill "Start reply with."** Per preset, seed the start of the model's
+  reply (native on Anthropic, emulated elsewhere).
+- **Sampler passthrough.** Repetition penalty, DRY, banned words / strings and
+  logit bias now pass through to providers that support them.
+- **OOC / Scene notes get variant controls** — a compact `‹ n/N ›` navigator
+  plus a `+` to write an alternate version of a note.
+- **Lorebooks moved into the library.** They now live as a segment in the
+  Characters/Personas tab instead of buried under More.
+- **Web send through a paired hub.** A browser/PWA paired to a desktop or
+  headless hub can now send chats through it even without its own provider
+  configured.
+- **Self-host: set the server's provider from the app.** Running the Docker /
+  headless hub? On the web client, adding your provider in **API Connections**
+  (the same screen you already use) configures the hub's provider — no
+  env/compose file to edit. Set it once and every connected device chats
+  through it. The key is stored on the server, pairing-gated, and never shown
+  back. (Env config still works and stays the default.)
+- **Self-host on Windows without Docker.** The headless hub also ships as a
+  plain Windows program — a folder you unzip and start by double-clicking a
+  `.bat` (no Docker, no install). Same server, same in-app provider setup.
+- **BotBooru embed now works on the self-host web build.** Browsing BotBooru
+  inside Discover (with "Import this card") — previously only when paired to a
+  desktop hub — now also works when you open the web app served by the Docker /
+  Windows headless hub. The hub runs BotBooru on a separate origin (port
+  `6768` by default, `PYRE_BBX_PORT`) so its scripts stay walled off from the
+  app. Docker publishes it automatically; if you wrote your own `docker run`,
+  add `-p 6768:6768` (import-by-URL keeps working without it).
+
+### Changed (self-host)
+
+- The self-host hub's default port is now **6767** (was 8080) — the same port
+  the desktop app's built-in hub uses, and it avoids clashing with other
+  services that grab 8080. If you were reaching your hub on `:8080`, use
+  `:6767` (or set `PYRE_PORT` back to 8080).
+- **In-app debug log viewer.** Read the raw LLM request/response log inside the
+  app (More → Storage → Developer).
+
+### Changed
+
+- **Rename chat** moved out of the in-chat menu onto the chat rows, where
+  list-organising actions belong.
+- **"Display" and "Theme" merged** into a single **Appearance** screen.
+- The standalone AI Lorebook Creator screen was removed — building a lorebook
+  now happens inside the Creator canvas (the focused entry builder is still
+  reachable from library lorebook management).
+- Impersonate and Guide no longer have their own provider routing (they follow
+  the main chat provider) — one less thing to misconfigure.
+- Dropped the Creator's "experimental" tags, the session-count badge and the
+  running token banner for a calmer screen.
+
+### Fixed
+
+- **Custom scenarios stay put.** A Fill-In-Your-Own scenario is now bound to the
+  greeting it was written for (it no longer leaks onto the card's other
+  greetings), and deleting that note can never cascade-delete the rest of the
+  chat.
+- **Continue extends cleanly** — the seam where it rejoined the previous text no
+  longer duplicates or drops words.
+- **No more blank streaming.** A regression that showed an empty bubble until the
+  whole reply finished is fixed; replies render token-by-token again.
+- **Data integrity.** Fixed backup/restore data-loss cases, cross-device sync
+  losing sibling edits (clock-domain mismatches), and a tombstone-resurrection
+  bug that could bring back deleted items.
+- **Creator survives strict local servers** and keeps the whole build coherent
+  under context pressure (reactive trim-and-retry on overflow).
+- Assorted party / persona-party correctness (Narrator vs. your persona group,
+  `{{char}}`/`{{user}}` fill, group lorebook de-duplication, token scaling).
+
+## [1.1.3] - 2026-06-17
+
+The biggest update since 1.1: an AI Lorebook Creator, app-wide color themes,
+BotBooru built into the web client, per-function model routing, native Anthropic
+support, plus a large stability and data-integrity pass.
+
+### Added
+
+- **AI Lorebook Creator.** Build lorebook entries by chatting with the model —
+  describe the world or character and it drafts entries (keywords + content) that
+  you edit and save to a new or existing book. Reachable on its own ("New lorebook
+  with AI", "Add entries with AI" per book) and directly from a card's lorebook
+  binding ("Create with AI").
+- **Color themes + accent.** Three curated palettes — Ember (default), Moonlit
+  (cool periwinkle/midnight) and Hearth (warm sepia/amber) — plus a custom
+  accent-color picker. (More → Display → Theme.)
+- **BotBooru in the web client.** The browser/LAN web build can now browse BotBooru
+  embedded — previously desktop/phone only — with "Import this card" and BotBooru's
+  own "Download PNG" importing straight into Pyre. (It runs on a separate, sandboxed
+  origin for security.)
+- **One-click web pairing.** A web client served by your desktop can pair by
+  clicking "Pair with this PC" — the desktop asks "Allow this device?" instead of
+  making you type host, port and token. (The token flow still works.)
+- **Per-function model routing.** Impersonate and Guide-my-message can use their
+  own provider/model, alongside the existing Creator and Vision overrides.
+- **Native Anthropic (Claude) support.** Connect directly to Anthropic's API, not
+  only OpenAI-compatible endpoints.
+- **Duplicate an API connection.** Copy an existing provider's configuration.
+- **Folders file cards away.** The home view shows your unfiled characters plus a
+  Folders section to drill into; search still spans everything.
+- **OOC and Scene messages are first-class** — editable, deletable, branchable,
+  with variants (regenerate stays character-only).
+- **Real downloads + streaming on the web build.** Exports (chat, card, persona,
+  backup, gallery) now save a real file instead of going to the clipboard, and chat
+  over the LAN proxy now streams token-by-token on the web.
+- **Mobile haptics** on send, add-variant, regenerate, long-press and variant-swipe.
+
+### Changed
+
+- New chats can default Checkpoints / Live Sheet to on or off (global setting), and
+  the auto-frequency "0" now clearly reads "automatic off — you can still make them
+  by hand."
+- Roomier lorebook entry editor (multi-line keyword fields, bigger content box,
+  wider/taller dialog).
+- Exporting a card or persona now embeds its bound lorebooks into the PNG so they
+  travel with the card; binding asks shared vs embedded.
+
+### Fixed
+
+- **Creator works on LM Studio and other strict local servers.** A rejected
+  `response_format` now degrades gracefully instead of killing the build.
+- **Creator: Edit-with-AI no longer overwrites your hand-written fields** (first
+  message, examples, tags, notes, greetings) — it keeps your values instead of
+  inventing new ones.
+- **Creator: alternate greetings are off by default** and generated only when you
+  ask, as genuinely different situations — no more unsolicited alternates.
+- **Creator: Stop actually stops** (and unlocks the UI); the build survives Android
+  backgrounding; cross-batch merges no longer overwrite a filled field with an empty
+  one; editing a message that has an image re-runs vision.
+- **Sync: phone → desktop records are no longer silently dropped** (a cross-clock
+  watermark bug); "keep this device" conflict resolution is now durable; a record
+  written during a sync is no longer skipped.
+- **Checkpoints & Live Sheet:** manual and automatic updates can no longer collide
+  and duplicate entries; a checkpoint binds to the right branch even if you swap or
+  regenerate mid-summary; Live Sheet "Generate from chat" preserves your locked
+  facts and manual edits instead of wiping them.
+- **Web/LAN:** BotBooru embed rendering, the import dialog's unresponsive buttons,
+  and a PWA manifest 401; plus LAN server request-size caps (abuse guard).
+- **Impersonate / Guide refusals** caused by a contradictory character-voice
+  instruction.
+- **Streaming performance:** no more avatar/image flicker from per-frame re-decode.
+- **Robustness:** no startup crash on a malformed backup, more tolerant lorebook
+  import, non-PNG avatars transcoded on export, and out-of-range sliders clamped.
+
+## [1.1.2] - 2026-06-07
+
+A hotfix for web (LAN) chat.
+
+### Fixed
+
+- **Web/LAN chat: "No provider configured" / proxy 503 / 403.** The provider-role
+  pointers (which provider is active for chat / creator / vision) were syncing
+  between the desktop host and a paired web client — but the web client has its
+  own separate provider list (it never receives your keys; it proxies chat
+  through the desktop). The mismatched pointer made selecting a provider on one
+  device deselect it on the other, breaking chat with "No provider configured"
+  or "provider not permitted." The pointers are now **device-local** (they don't
+  sync to/from the web), and a paired web client always proxies through whatever
+  provider is **active on the desktop** — no provider setup needed on the web
+  side. (You may need to re-select your provider once per device after updating.)
+
+## [1.1.1] - 2026-06-07
+
+A hotfix for a critical packaging bug in 1.1.0.
+
+### Fixed
+
+- **LAN web access ("Route Not Found").** The desktop builds shipped without the
+  web client bundled next to the executable, so the built-in LAN server had
+  nothing to serve at its root URL — every device that opened the desktop's
+  address in a browser got "Route Not Found." The desktop builds now bundle the
+  web UI, so starting the LAN server and opening the address in a browser works
+  out of the box. Thanks to the community for the report.
+- **Chat-bubble blur flicker on scroll.** The bubble backdrop blur is now
+  isolated to its own compositing layer, which stops the frost from flickering
+  as the message list scrolls on some (GPU-dependent) devices.
+- **Checkpoints / Live Sheet "still on" confusion.** Clarified that setting the
+  auto-checkpoint frequency to 0 turns off only the *automatic* checkpoints —
+  you can still make them by hand — and the in-chat "Memories" menu now reads
+  "Off — state tracking disabled for this chat." when Live Sheet is disabled,
+  instead of an ambiguous label. Thanks to the community for the reports.
+
+## [1.1.0] - 2026-06-06
+
+> Draft date — final date set at release.
+
+Pyre 1.1 is the first feature release after the 1.0 launch. It focuses on the
+"power user" requests from the community: deeper control over how prompts are
+built, importing your existing SillyTavern setup wholesale, customizing how
+chats look, and a round of stability and data-integrity fixes that make backups
+and long sessions more trustworthy.
+
+### Added
+
+- **Composable presets (Prompt Manager).** Presets can now hold a list of named
+  prompt blocks, each with its own on/off switch. Import a modular preset and
+  toggle which modules are active without editing any text. Reorder, rename, edit
+  and add blocks in the preset editor. Flat (single-prompt) presets are
+  unchanged and keep their simple editor.
+- **Bulk SillyTavern import.** Select many files at once and Pyre sniffs each one
+  and routes it to the right place — character cards, lorebooks, regex rules and
+  presets all in a single pass, with a summary of what came in and what didn't.
+- **One-tap BotBooru lorebook import.** On a lorebook page in the in-app Discover
+  browser, "Download JSON" now imports the lorebook straight into Pyre — the same
+  one-tap flow as character cards, with a confirmation showing the name and entry
+  count. (Mobile and desktop; see Platforms for Web.)
+- **Regex find/replace rules.** A global list of find/replace rules that can
+  clean up model output, your own input, or just what's shown on screen. Rules
+  can apply to the saved message, only to what the model sees, or only to what's
+  rendered — mirroring SillyTavern's behavior. Includes a test field, an
+  invalid-pattern guard so a bad rule can never break a chat, and import of
+  SillyTavern regex `.json` files. Ships with one safe default rule —
+  *"Unwrap italics around dialogue"* — that strips the italic asterisks models
+  often wrap spoken lines in (`*"Hello."*`), so dialogue renders as dialogue
+  instead of faint narration; it's display-only and you can toggle or delete it
+  any time.
+- **Chat bubble customization.** Separate colors for your bubbles and the
+  character's, plus adjustable corner radius, border, padding, text size, and a
+  backdrop blur so text stays readable over busy chat backgrounds.
+- **Lorebook keyword options.** Entries now support secondary keys with
+  AND/NOT logic, per-entry case sensitivity, whole-word matching, and a trigger
+  probability. SillyTavern World Info imports carry these fields over.
+- **`{{summary}}` macro.** Drop `{{summary}}` into a preset to place the
+  long-term-memory recap exactly where you want it instead of relying on the
+  default injection point.
+- **Quick preset switch from inside a chat.** Change the active preset (and tweak
+  the main prompt) from the chat itself, without going back to Settings.
+- **Global UI scale.** A slider to shrink or enlarge the whole interface — useful
+  on small or high-density phones.
+- **Per-provider prompt post-processing.** Optional SillyTavern-style reshaping
+  of the outgoing message list (merge consecutive turns, single system message,
+  strict user/assistant alternation, or collapse to one user message) for models
+  and routes that are strict about message shape. Off by default; existing
+  requests are unchanged.
+- **Duplicate a character or persona** from its menu, to fork a card without
+  re-importing or rebuilding it.
+- **Avatar thumbnails frame the face.** Portrait card art is now auto-cropped
+  toward the face in the circular thumbnail instead of being squished whole into
+  the circle — no manual cropping needed.
+- **Non-destructive recrop.** Re-framing an avatar keeps the full original: the
+  thumbnail shows the crop, but tapping it (and the chat backdrop) shows the
+  whole picture. Works for characters, personas and your BotBooru profile, and
+  the original travels with sync so it isn't broken on a second device.
+- **More import sources.** Import character cards from a direct `.png`/`.json`
+  link, from catbox.moe / pixeldrain, and from RisuRealm
+  (`realm.risuai.net`) — on top of BotBooru, chub.ai and the existing flows.
+- **Your BotBooru profile syncs.** Username, avatar, bio, title, pronouns and
+  featured character now travel between your paired devices, as their own
+  last-writer-wins unit so an unrelated settings sync can never blank them.
+- **"Check sync" + a sync status indicator.** Confirm both devices hold the same
+  library via a per-collection fingerprint, and see what the last sync moved
+  (pulled / pushed) and when, right on the LAN screen.
+- **Local model server quality-of-life.** Optionally preload your local model on
+  launch and use longer connect/stall timeouts so the first request survives a
+  cold load (LM Studio / Ollama), plus clearer localhost-provider hints.
+- **Desktop Enter-to-send in the Character Creator** (Shift+Enter inserts a
+  newline; on Android, Enter stays a newline and the send button commits).
+- **Import a whole SillyTavern backup.** Point Pyre at ST's "Download Backup"
+  `.zip` and it pulls in your cards, world info, presets, regex scripts and chat
+  logs in one pass — and hard-skips `secrets.json`, so your ST API keys are never
+  read.
+- **SillyTavern chat-log import.** Chat `.jsonl` files import with their swipes
+  preserved as message variants, bound to the matching character.
+- **"Guide my message."** A distinct action from "Impersonate me": instead of
+  writing the whole next turn as your persona, it steers the upcoming reply from
+  an outline / perspective you provide.
+- **Rename a chat** from its menu.
+- **Better reasoning-model support.** A model's "thinking" channel is handled and
+  kept out of the visible reply (and out of Checkpoints summaries).
+
+### Changed
+
+- **Long-Term Memory is now called "Checkpoints"** throughout the app — clearer
+  language for the same continuous-recap feature.
+- **Backups now include your images.** Avatars and gallery images are packed into
+  the backup file, so restoring on a fresh install or a second device brings the
+  pictures with it instead of leaving placeholders.
+- **Sync got safer.** Conflicting edits to the same chat across two devices are
+  now detected and surfaced (instead of one side silently winning), and folders
+  and your forked Creator/architect prompts now sync between devices.
+- **Imported avatars no longer bloat your data file.** Card and image imports now
+  store the picture as a content-addressed file like everything else, instead of
+  inlining it into the main JSON store on every save.
+- **Real "Save to device" on Android.** Exporting a card now goes through the
+  system file picker / share sheet instead of vanishing into app-private storage.
+- **Your settings sync too.** Model, chat, memory, Live Sheet, script and guide
+  settings — plus your active / Creator / vision provider choices — now sync
+  between devices. Your custom chat background stays per-device on purpose.
+- **Volume-safe image sync.** Sync now uploads only the image bytes the other
+  device is missing (content-addressed negotiation), so syncing a big library
+  never re-sends gigabytes of pictures the other side already has.
+- **The Character Creator opens on the chat** (not an empty sheet) and no longer
+  shows internal "block" wording anywhere in its chat, status text or help.
+
+### Fixed
+
+- Fixed a Windows crash that could hit anyone during normal use (a null-dereference
+  in the desktop window layer's accessibility bridge), plus a big performance pass
+  so large libraries no longer slow down or crash as you add lots of cards.
+- Fixed a desktop UI-thread hang that could occur when changing the text scale or
+  resizing the window.
+- The Creator no longer silently discards a card if you send a chat message while
+  a build is in progress.
+- The Live Sheet now actually tracks state on a new chat when it's enabled,
+  rather than staying inert until manually toggled off and on.
+- Persona `{{user}}`/`{{char}}` placeholders are now resolved when generating an
+  opening message, instead of leaking through literally.
+- SillyTavern-imported modular presets now include the character, persona and
+  lorebook in the prompt (previously they could ship only the jailbreak text).
+- The provider editor no longer leaks text fields (and your API key) in memory
+  each time it's opened; the same leak was fixed across the character editor,
+  persona editor, preset/lorebook editors and many smaller dialogs.
+- Provider Browse / Test / warm-up requests now have the same private-network
+  safety guard as imports.
+- Lorebook injection order is now stable and deterministic from build to build
+  (better prompt-cache hits, reproducible regenerations).
+- The in-chat preset quick-edit no longer pretends to save changes on modular
+  presets where they wouldn't apply.
+- Soft-deleted personas no longer appear in the persona picker.
+- Out-of-range slider values from older builds, sync or backups no longer crash
+  or render oddly on the Presets screen.
+- Card-fetch helpers now have timeouts, so a stalled host can't hang an import
+  forever; the desktop sync server now caps incoming push bodies.
+- Failed saves are now surfaced instead of silently swallowed.
+- Vision (image-reference) profiles get a more generous output budget and a soft
+  "may be truncated" note, reducing silently cut-off appearance profiles.
+- Various list-virtualization and caching improvements to keep long sessions and
+  large libraries responsive.
+- BotBooru "Download PNG" (and pulling in the image gallery) broke after a site
+  change — fixed by following the card id from the page URL.
+- "Impersonate me" is back as its own action — write the next message *as* your
+  persona — separate from "Guide my message" (which only outlines/steers).
+- An "Exported" notice that could stay on screen forever now always dismisses.
+- Re-pairing — or pointing at a reset PC — could leave only some cards / chats /
+  presets synced; sync now detects the new device and does a full reconcile.
+- Fixed a crash and a leftover background process when quitting from the tray.
+- The Checkpoints summary prompt now updates itself on upgrade instead of keeping
+  the old one.
+- API-key sync hardened in both directions — re-stamps providers when you enable
+  it and resets cleanly on re-pair — so keys reliably reach a newly opted-in
+  device.
+- LAN hardening: a generous per-device rate limit on the model proxy, same-origin
+  CORS, and redirect-free + size-capped card fetches.
+- Image-reference (vision) profiles strip any leaked model "reasoning" preamble
+  and run in a closed circuit — no roleplay prompt or sampling settings bleed in.
+- **Broad provider compatibility.** A request a strict provider rejects for shape
+  reasons now auto-retries once with a minimal safe body, and known-strict
+  providers (OpenAI reasoning models, Mistral) proactively drop the fields they
+  reject (`max_completion_tokens` vs `max_tokens`, the extended samplers).
+  Permissive providers (OpenRouter, Venice, local, …) are unaffected.
+- **Windows "Stability mode."** Machines that crashed through the GPU-overlay +
+  accessibility path (e.g. the NVIDIA GeForce overlay hooking the present chain)
+  can switch on a per-machine stability mode that steers the engine onto
+  lower-risk graphics / accessibility paths at the next launch.
+
+### Platforms
+
+Pyre 1.1 ships for **Android, Windows, Linux and Web**.
+
+- **Android, Windows and Linux** are full native apps — your characters, chats,
+  presets and keys live on the device.
+- **Web / PWA is a companion client, not a standalone app.** Open Pyre in a
+  browser — including **iOS Safari → "Add to Home Screen"** for an app-like icon,
+  which is how you use Pyre on iPhone/iPad (there is no native iOS app) — and
+  **pair it with your desktop Pyre over your local network**. It mirrors your
+  desktop's library and runs models *through* your desktop, so it needs your
+  desktop Pyre running and reachable; there is no offline/standalone web mode.
+  On Web, in-app Discover browsing and one-tap card/lorebook import aren't
+  available (browsers can't embed the source site) — open links externally or
+  paste a URL — and chats use your global model settings.
+
+---
+
+## [1.0.8] - 2026-06-03
+
+- Fixed the Character Creator app bar overflowing on narrow screens.
+
+## [1.0.7] - 2026-06-03
+
+- Added standalone SillyTavern lorebook import.
+
+## [1.0.6] - 2026-06-03
+
+- Creator and Fill-In fixes.
+
+## [1.0.5] - 2026-06-02
+
+- The long-term-memory summariser now retries once after a transient provider
+  blip.
+
+## [1.0.4] - 2026-06-02
+
+- Key sync now backfills a missing key onto an existing provider.
+
+## [1.0.3] - 2026-06-02
+
+- Phone-side provider-key sync toggle, full re-pull, and provider delete.
+
+## [1.0.2] - 2026-06-02
+
+- Fixed API key / provider sync doing nothing (providers were stuck at
+  `mtime=0`).
+
+## [1.0.1] - 2026-06-02
+
+- Fixed chat backgrounds appearing blank for avatar / `pyre://` image sources.
+
+## [1.0.0] - 2026-06-02
+
+- First public release of Pyre — a private, local-first, bring-your-own-API-key
+  roleplay chat client. Includes streaming chat with variants and branching, the
+  AI Character/Scenario Creator, personas, lorebooks/world info, presets and
+  sampling, Checkpoints (long-term memory), card import/export (chara_card_v2
+  PNG/JSON, by URL, and from community sources), smart provider fallback,
+  LAN sync between your own devices, bundled example cards, and desktop features
+  (tray, shortcuts, command palette, completion toasts).

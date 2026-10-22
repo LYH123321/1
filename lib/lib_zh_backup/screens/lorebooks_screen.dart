@@ -1,0 +1,1098 @@
+import 'dart:convert';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+
+import '../models/models.dart';
+import '../services/lorebook_import.dart';
+import '../services/token_estimate.dart';
+import '../state/app_store.dart';
+import '../theme.dart';
+import '../widgets/confirm_dialog.dart';
+import '../widgets/empty_state.dart';
+import '../widgets/lorebook_binding_section.dart'
+    show LorebookUsedBySection, askEmbeddedChoice;
+import '../widgets/menu_sheet.dart';
+import 'character_assistant_screen.dart' show CharacterAssistantScreen;
+// 2026-07-13 (community request): folders organise lorebooks too. The shared
+// folder-section widgets + the generalized add-to-folder sheet live next to
+// their character originals; this narrow re-import mirrors the
+// chat_picker_screens.dart `show topLevelVisibleCharacters` pattern
+// (characters_screen already imports this file the same way).
+import 'characters_screen.dart'
+    show
+        ActiveFolderChip,
+        AllFiledHint,
+        FolderRow,
+        FolderSectionHeader,
+        showAddToFolderSheet,
+        topLevelVisibleLorebooks;
+
+// 2026-07-03 (Gui): Lorebooks moved OUT of More and into the library next to
+// Characters and Personas — they're content, not a setting. The standalone
+// LorebooksScreen scaffold is gone; [LorebookList] is the segment body the
+// library tab embeds (with search), and the create/import actions
+// ([editLorebook] / [importLorebookFile]) are driven from the tab's Create
+// button. LorebookEditScreen and the kebab below are unchanged.
+class LorebookList extends StatelessWidget {
+  final AppStore store;
+  final String query;
+  const LorebookList({super.key, required this.store, this.query = ''});
+
+  @override
+  Widget build(BuildContext context) {
+    // Wave CA: hide books with hidden=true from the management list.
+    // They were created via the "embedded only" choice on character
+    // import and live solely to back that character's bound list; we
+    // still show their count in the empty-state copy so the user
+    // doesn't think their card lost its lore.
+    final q = query.trim().toLowerCase();
+    final allVisible = store.lorebooks
+        .where((b) => !b.hidden && !b.deleted)
+        .toList(growable: false);
+    // 2026-07-13 (community request): folder-aware pool (mirrors the
+    // Characters list). The pure helper handles the folder-scoped view
+    // (via store.loreFolderId), the search-all override, and hide-filed-
+    // on-home; text matching stays below — the helper only decides which
+    // books are in scope.
+    final pool = topLevelVisibleLorebooks(
+      store.lorebooks,
+      store.folders,
+      activeFolderId: store.loreFolderId,
+      query: q,
+    );
+    final visibleBooks = q.isEmpty
+        ? pool
+        : pool
+            .where((b) =>
+                '${b.name} ${b.description}'.toLowerCase().contains(q))
+            .toList(growable: false);
+    final hiddenCount = store.lorebooks.length - allVisible.length;
+    if (allVisible.isEmpty) {
+      return EmptyState(
+        icon: Icons.menu_book_outlined,
+        title: 'No lorebooks yet',
+        subtitle: hiddenCount > 0
+            ? 'You have $hiddenCount embedded lorebook${hiddenCount == 1 ? "" : "s"} '
+                'bound to characters (kept out of this list to reduce '
+                'clutter — they still inject in chat). Create or import '
+                'a new one to add it here.'
+            : 'Lorebooks let you attach world info or facts that get injected into the chat when keywords are mentioned — useful for keeping the AI consistent about places, factions, lore, etc.',
+        ctaLabel: 'Create',
+        ctaIcon: Icons.add,
+        onCta: () => editLorebook(context, null),
+      );
+    }
+
+    // 2026-07-13 (community request): inline Folders section on the home
+    // view + the book cards, flattened into one row list (mirrors the
+    // Characters list's item flattening; rows here are cheap to construct —
+    // no avatar decode — and the builder below still inflates lazily).
+    final liveFolders = store.folders.where((f) => !f.deleted).toList();
+    final onHome = store.loreFolderId == null && q.isEmpty;
+    final items = <Widget>[];
+    if (onHome && liveFolders.isNotEmpty) {
+      items.add(const FolderSectionHeader());
+      for (final f in liveFolders) {
+        items.add(FolderRow(
+          folder: f,
+          count: f.lorebookIds.length,
+          countNoun: 'book',
+          onTap: () => store.setLoreFolderId(f.id),
+        ));
+      }
+      // Gap between folders and the unfiled books below.
+      items.add(const SizedBox(height: 8));
+    }
+    for (final l in visibleBooks) {
+      items.add(Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: _bookCard(context, l),
+      ));
+    }
+    if (visibleBooks.isEmpty && onHome && liveFolders.isNotEmpty) {
+      // All books are filed — a gentle hint below the Folders section
+      // instead of the abrupt "No matches" empty state.
+      items.add(const AllFiledHint(
+        message: 'All your lorebooks are in folders.\n'
+            'Open a folder above to browse.',
+      ));
+    }
+
+    // Name of the active folder for the back-affordance chip. Empty string =
+    // the folder vanished mid-view (chip falls back, ✕ still exits).
+    final folderName = store.loreFolderId == null
+        ? null
+        : store.folders
+            .firstWhere(
+              (f) => f.id == store.loreFolderId,
+              orElse: () => Folder(id: '', name: ''),
+            )
+            .name;
+
+    return Column(
+      children: [
+        // Back affordance out of the open folder — identical to the
+        // Characters chip's ✕ exit. Only rendered inside a folder (this
+        // segment has no other org controls).
+        if (folderName != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: ActiveFolderChip(
+                folderName: folderName,
+                onClear: () => store.setLoreFolderId(null),
+              ),
+            ),
+          ),
+        Expanded(
+          child: items.isEmpty
+              ? const EmptyState(
+                  icon: Icons.search_off,
+                  title: 'No matches',
+                  subtitle: 'Nothing matches your search.',
+                )
+              : ListView.builder(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  itemCount: items.length,
+                  itemBuilder: (context, i) => items[i],
+                ),
+        ),
+      ],
+    );
+  }
+
+  /// One lorebook row card. Extracted unchanged from the pre-folders
+  /// `ListView.separated` itemBuilder (2026-07-13 — the list body now mixes
+  /// folder rows and book cards, see `build`).
+  Widget _bookCard(BuildContext context, Lorebook l) {
+    return Card(
+      child: ListTile(
+        leading: Icon(Icons.menu_book_outlined,
+            color: EmberColors.textMid),
+        title: Text(l.name,
+            style: const TextStyle(fontWeight: FontWeight.w600)),
+        // Wave CM: subtitle now includes the lorebook's
+        // token weight (sum across enabled entries) so the
+        // user can see at a glance how much of their
+        // context budget a book consumes.
+        subtitle: Builder(builder: (_) {
+          final tokenLabel =
+              formatTokenCount(approxTokensForLorebook(l));
+          final base = '${l.entries.length} entries'
+              '${l.description.isNotEmpty ? "  ·  ${l.description}" : ""}';
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Text(
+                  base,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      color: EmberColors.textMid),
+                ),
+              ),
+              if (tokenLabel != null) ...[
+                const SizedBox(width: 6),
+                Padding(
+                  padding: const EdgeInsets.only(top: 1),
+                  child: Text(
+                    tokenLabel,
+                    style: TextStyle(
+                      color: EmberColors.textDim,
+                      fontSize: 10,
+                      fontFeatures: [
+                        FontFeature.tabularFigures()
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          );
+        }),
+        trailing: IconButton(
+          icon: Icon(Icons.more_vert,
+              color: EmberColors.textMid),
+          tooltip: 'Lorebook actions',
+          onPressed: () => _openLorebookKebab(context, l),
+        ),
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => LorebookEditScreen(lorebookId: l.id),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 2026-07-13 (owner design pass): tiny section label for the long kebab
+/// menus (≥7 items) — see the twin `_menuSectionLabel` in
+/// characters_screen.dart for the pattern's provenance (chat_settings
+/// `_sectionLabel` text style + export-sheet header placement).
+Widget _menuSectionLabel(String text) => Padding(
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 4),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          text.toUpperCase(),
+          style: TextStyle(
+            color: EmberColors.textDim,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.6,
+          ),
+        ),
+      ),
+    );
+
+Future<void> _openLorebookKebab(BuildContext context, Lorebook l) async {
+  final store = context.read<AppStore>();
+  final messenger = ScaffoldMessenger.of(context);
+  // 2026-07-13 (owner design pass): folder membership resolved up front so
+  // "Add to folder…" only shows a subtitle when it carries live state
+  // ("In: …") — the empty-state explainer line is gone.
+  final folderNames = store.folders
+      .where((f) => f.lorebookIds.contains(l.id))
+      .map((f) => f.name)
+      .toList();
+  // 2026-07-13 (owner design pass): the 8 flat items grouped under section
+  // labels (EDIT / EXPORT / LIBRARY), and Delete moved behind a divider like
+  // every other kebab. Same actions, same handlers, same order.
+  await showMenuSheet<void>(
+    context,
+    itemsBuilder: (sheet) => [
+          _menuSectionLabel('Edit'),
+          ListTile(
+            leading: const Icon(Icons.edit_outlined),
+            title: const Text('Edit entries'),
+            onTap: () {
+              Navigator.pop(sheet);
+              Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => LorebookEditScreen(lorebookId: l.id),
+              ));
+            },
+          ),
+          // 2026-07-04 (Gui, granular editing): edit THIS book with the AI
+          // Creator — entries pre-loaded, Save updates it in place.
+          ListTile(
+            leading: Icon(Icons.auto_awesome, color: EmberColors.primary),
+            title: const Text('Edit with AI'),
+            onTap: () {
+              Navigator.pop(sheet);
+              Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) =>
+                    CharacterAssistantScreen(editingLorebookId: l.id),
+              ));
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.drive_file_rename_outline),
+            title: const Text('Rename / describe'),
+            onTap: () {
+              Navigator.pop(sheet);
+              editLorebook(context, l);
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.copy),
+            title: const Text('Copy as new'),
+            onTap: () {
+              Navigator.pop(sheet);
+              final clone = Lorebook(
+                id: newId('lore'),
+                name: '${l.name} (copy)',
+                description: l.description,
+                entries: l.entries
+                    .map((e) => LoreEntry(
+                          id: newId('lore-entry'),
+                          keys: [...e.keys],
+                          content: e.content,
+                          constant: e.constant,
+                          enabled: e.enabled,
+                          order: e.order,
+                          secondaryKeys: [...e.secondaryKeys],
+                          selectiveLogic: e.selectiveLogic,
+                          caseSensitive: e.caseSensitive,
+                          matchWholeWords: e.matchWholeWords,
+                          probability: e.probability,
+                          useProbability: e.useProbability,
+                          characterFilterNames: [...e.characterFilterNames],
+                          characterFilterExclude: e.characterFilterExclude,
+                        ))
+                    .toList(),
+              );
+              store.addLorebook(clone);
+              messenger.showSnackBar(
+                SnackBar(content: Text('Copied as "${clone.name}".')),
+              );
+            },
+          ),
+          _menuSectionLabel('Export'),
+          ListTile(
+            leading: const Icon(Icons.file_download_outlined),
+            title: const Text('Export JSON'),
+            onTap: () async {
+              Navigator.pop(sheet);
+              final json =
+                  const JsonEncoder.withIndent('  ').convert(l.toJson());
+              await Clipboard.setData(ClipboardData(text: json));
+              messenger.showSnackBar(
+                const SnackBar(content: Text('Lorebook JSON copied.')),
+              );
+            },
+          ),
+          ListTile(
+            leading: Icon(Icons.link, color: EmberColors.textMid),
+            title: const Text('Embed into a card…'),
+            onTap: () async {
+              Navigator.pop(sheet);
+              await _embedIntoCard(context, store, l, messenger);
+            },
+          ),
+          _menuSectionLabel('Library'),
+          // 2026-07-13 (community request): lorebooks file into folders too —
+          // the same sub-sheet as the character/persona kebabs, over
+          // folder.lorebookIds.
+          ListTile(
+            leading: const Icon(Icons.folder_open_outlined),
+            title: const Text('Add to folder…'),
+            subtitle: folderNames.isEmpty
+                ? null
+                : Text(
+                    'In: ${folderNames.join(", ")}',
+                    style: TextStyle(
+                        color: EmberColors.textMid, fontSize: 12),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+            onTap: () async {
+              Navigator.pop(sheet);
+              await showAddToFolderSheet(
+                context,
+                store,
+                itemName: l.name,
+                countNoun: 'book',
+                countOf: (f) => f.lorebookIds.length,
+                isMember: (f) => f.lorebookIds.contains(l.id),
+                add: (f) => store.addLorebookToFolder(f.id, l.id),
+                remove: (f) => store.removeLorebookFromFolder(f.id, l.id),
+              );
+            },
+          ),
+          Divider(color: EmberColors.stroke),
+          ListTile(
+            leading: Icon(Icons.delete_outline,
+                color: EmberColors.danger),
+            title: Text('Delete',
+                style: TextStyle(color: EmberColors.danger)),
+            onTap: () async {
+              Navigator.pop(sheet);
+              final ok = await confirmDelete(
+                context,
+                title: 'Delete "${l.name}"?',
+                message:
+                    'The lorebook will be removed and detached from every chat using it.',
+              );
+              if (!ok) return;
+              store.removeLorebook(l.id);
+            },
+          ),
+        ],
+  );
+}
+
+// ── Embed into a card ────────────────────────────────────────────────────────
+
+/// Pick a character, ask shared/embedded, then bind this lorebook to
+/// the chosen character. D1: always ask shared-vs-embedded.
+Future<void> _embedIntoCard(
+  BuildContext context,
+  AppStore store,
+  Lorebook l,
+  ScaffoldMessengerState messenger,
+) async {
+  final characters = store.characters.where((c) => !c.deleted).toList();
+  if (characters.isEmpty) {
+    messenger.showSnackBar(
+      const SnackBar(content: Text('No characters found. Create one first.')),
+    );
+    return;
+  }
+
+  // Step 1: pick a character.
+  Character? picked;
+  await showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: EmberColors.bgPanel,
+    isScrollControlled: true,
+    builder: (sheet) => SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(sheet).size.height * 0.7,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Row(
+                children: [
+                  Icon(Icons.person, color: EmberColors.primary),
+                  const SizedBox(width: 10),
+                  const Text(
+                    'Embed into which card?',
+                    style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    icon: Icon(Icons.close, color: EmberColors.textMid),
+                    onPressed: () => Navigator.pop(sheet),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: ListView.separated(
+                shrinkWrap: true,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                itemCount: characters.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 4),
+                itemBuilder: (_, i) {
+                  final c = characters[i];
+                  final alreadyBound = c.lorebookIds.contains(l.id);
+                  return Card(
+                    child: ListTile(
+                      enabled: !alreadyBound,
+                      leading: Icon(
+                        Icons.person,
+                        color: alreadyBound
+                            ? EmberColors.textDim
+                            : EmberColors.textMid,
+                      ),
+                      title: Text(
+                        c.name,
+                        style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          color: alreadyBound
+                              ? EmberColors.textDim
+                              : EmberColors.textHigh,
+                        ),
+                      ),
+                      trailing: alreadyBound
+                          ? Icon(Icons.check,
+                              color: EmberColors.textDim, size: 18)
+                          : null,
+                      onTap: alreadyBound
+                          ? null
+                          : () {
+                              picked = c;
+                              Navigator.pop(sheet);
+                            },
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  if (picked == null) return;
+  if (!context.mounted) return;
+
+  // Step 2: D1 — ALWAYS ask shared-vs-embedded.
+  // We import the helper from lorebook_binding_section.
+  final embedded = await askEmbeddedChoice(context);
+  if (embedded == null) return; // cancelled
+  if (!context.mounted) return;
+
+  // Apply: set hidden per choice, bind to character.
+  final book = l;
+  if (book.hidden != embedded) {
+    book.hidden = embedded;
+    store.updateLorebook(book);
+  }
+  final char = picked!;
+  if (!char.lorebookIds.contains(book.id)) {
+    char.lorebookIds.add(book.id);
+    store.updateCharacter(char);
+  }
+
+  messenger.showSnackBar(
+    SnackBar(
+      content: Text(
+        embedded
+            ? 'Embedded "${l.name}" into ${char.name}. '
+                'It will travel when you export that card.'
+            : 'Linked "${l.name}" to ${char.name} as a shared lorebook.',
+      ),
+    ),
+  );
+}
+
+// (2026-07-03, owner decision: the standalone AI lorebook creator was removed
+// — the Creator's lorebook canvas mode is the one AI path, launched from the
+// library's Lorebooks section via Create → Build with AI
+// (CharacterAssistantScreen(lorebookMode: true)). Manual creation, entry
+// editing, import and Copy-as-new all remain here.)
+
+/// Wave CA: import a lorebook from a JSON file picked off device storage.
+/// Accepts a few related shapes (see [tryParseLorebookJson]):
+///   - chara_card_v2 full card (we extract `data.character_book`)
+///   - bare `character_book` object
+///   - SillyTavern World Info — standalone export `{entries: {uid: …}}`
+///     (object keyed by uid) or the array form `{entries: [...]}`
+///   - Pyre's own Lorebook.toJson round-trip
+Future<void> importLorebookFile(BuildContext context) async {
+  final store = context.read<AppStore>();
+  final messenger = ScaffoldMessenger.of(context);
+  try {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['json'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final f = result.files.first;
+    final bytes = f.bytes;
+    if (bytes == null) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Could not read the file.')),
+      );
+      return;
+    }
+    final text = utf8.decode(bytes);
+    Map<String, dynamic> root;
+    try {
+      root = jsonDecode(text) as Map<String, dynamic>;
+    } catch (e) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('Invalid JSON: $e')),
+      );
+      return;
+    }
+    final fallbackName = f.name.replaceAll(RegExp(r'\.json$'), '');
+    final book = tryParseLorebookJson(root, nameFallback: fallbackName);
+    if (book == null) {
+      messenger.showSnackBar(
+        const SnackBar(
+            content: Text(
+                'Not a recognised lorebook format — expected chara_card_v2 character_book, SillyTavern world-info, or Pyre lorebook JSON.')),
+      );
+      return;
+    }
+    store.addLorebook(book);
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+            'Imported "${book.name}" — ${book.entries.length} entries.'),
+      ),
+    );
+  } catch (e) {
+    messenger.showSnackBar(
+      SnackBar(content: Text('Import failed: $e')),
+    );
+  }
+}
+
+Future<void> editLorebook(BuildContext context, Lorebook? existing) async {
+  final store = context.read<AppStore>();
+  final nameCtl =
+      TextEditingController(text: existing?.name ?? 'New lorebook');
+  final descCtl = TextEditingController(text: existing?.description ?? '');
+  // Completeness-gaps: inline blank-name error (was a silent no-op). Tracked
+  // via StatefulBuilder so the dialog can rebuild with the error / clear it.
+  String? nameError;
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setLocal) => AlertDialog(
+        backgroundColor: EmberColors.bgPanel,
+        title: Text(existing == null ? 'New lorebook' : 'Rename lorebook'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: nameCtl,
+              decoration: InputDecoration(
+                labelText: 'Name',
+                errorText: nameError,
+              ),
+              onChanged: (_) {
+                if (nameError != null && nameCtl.text.trim().isNotEmpty) {
+                  setLocal(() => nameError = null);
+                }
+              },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: descCtl,
+              maxLines: 2,
+              decoration: const InputDecoration(labelText: 'Description'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              final name = nameCtl.text.trim();
+              if (name.isEmpty) {
+                setLocal(() => nameError = 'Name is required');
+                return;
+              }
+              if (existing == null) {
+                store.addLorebook(Lorebook(
+                  id: newId('lore'),
+                  name: name,
+                  description: descCtl.text.trim(),
+                ));
+              } else {
+                existing
+                  ..name = name
+                  ..description = descCtl.text.trim();
+                store.updateLorebook(existing);
+              }
+              Navigator.pop(ctx);
+            },
+            child: Text(existing == null ? 'Create' : 'Save'),
+          ),
+        ],
+      ),
+    ),
+  );
+  // H-3: dispose the lorebook name/description controllers on dialog close.
+  nameCtl.dispose();
+  descCtl.dispose();
+}
+
+class LorebookEditScreen extends StatelessWidget {
+  final String lorebookId;
+  const LorebookEditScreen({super.key, required this.lorebookId});
+
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<AppStore>();
+    final lore = store.lorebookById(lorebookId);
+    if (lore == null) {
+      return Scaffold(
+        appBar: AppBar(),
+        body: const Center(child: Text('Lorebook not found')),
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(lore.name, overflow: TextOverflow.ellipsis),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.add),
+            tooltip: 'New entry',
+            onPressed: () => _addEntry(context, lore),
+          ),
+        ],
+      ),
+      // Wave CC: Used-by banner pinned above the entries list so the
+      // user can see which characters / personas / chats reference this
+      // book without leaving the screen. Read-only on this side —
+      // binding happens from the char/persona editor.
+      body: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            decoration: BoxDecoration(
+              border: Border(
+                bottom: BorderSide(color: EmberColors.stroke, width: 0.5),
+              ),
+            ),
+            child: LorebookUsedBySection(lorebookId: lore.id),
+          ),
+          Expanded(
+            child: lore.entries.isEmpty
+          ? const EmptyState(
+              icon: Icons.format_list_bulleted,
+              title: 'No entries',
+              subtitle:
+                  'Add an entry with one or more trigger keywords and the text to inject.',
+            )
+          : ListView.separated(
+              padding: const EdgeInsets.all(16),
+              itemCount: lore.entries.length,
+              separatorBuilder: (context, index) => const SizedBox(height: 8),
+              itemBuilder: (context, i) {
+                final entry = lore.entries[i];
+                return Card(
+                  child: ExpansionTile(
+                    title: Text(
+                      entry.keys.isEmpty
+                          ? (entry.constant ? '(constant)' : '(no keys)')
+                          : entry.keys.join(', '),
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    subtitle: Text(
+                      entry.content,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: EmberColors.textMid),
+                    ),
+                    trailing: Switch(
+                      value: entry.enabled,
+                      activeThumbColor: EmberColors.primary,
+                      onChanged: (v) {
+                        entry.enabled = v;
+                        store.updateLorebook(lore);
+                      },
+                    ),
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            CheckboxListTile(
+                              title: const Text('Always inject (constant)'),
+                              value: entry.constant,
+                              activeColor: EmberColors.primary,
+                              contentPadding: EdgeInsets.zero,
+                              dense: true,
+                              onChanged: (v) {
+                                entry.constant = v ?? false;
+                                store.updateLorebook(lore);
+                              },
+                            ),
+                            const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: ElevatedButton.icon(
+                                    onPressed: () =>
+                                        _editEntry(context, lore, entry),
+                                    icon: const Icon(Icons.edit, size: 16),
+                                    label: const Text('Edit'),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                IconButton(
+                                  icon: Icon(Icons.delete_outline,
+                                      color: EmberColors.danger),
+                                  tooltip: 'Delete entry',
+                                  // Completeness-gaps: confirm like every other
+                                  // delete in the app (was an immediate remove).
+                                  onPressed: () async {
+                                    final ok = await confirmDelete(
+                                      context,
+                                      title: 'Delete entry?',
+                                      message:
+                                          'This lorebook entry will be removed.',
+                                    );
+                                    if (!ok) return;
+                                    lore.entries.removeWhere(
+                                        (e) => e.id == entry.id);
+                                    store.updateLorebook(lore);
+                                  },
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Future<void> _addEntry(BuildContext context, Lorebook lore) async {
+  final entry = LoreEntry(id: newId('lore-entry'));
+  await _editEntry(context, lore, entry, isNew: true);
+}
+
+Future<void> _editEntry(
+  BuildContext context,
+  Lorebook lore,
+  LoreEntry entry, {
+  bool isNew = false,
+}) async {
+  final store = context.read<AppStore>();
+  final keysCtl = TextEditingController(text: entry.keys.join(', '));
+  final secondaryCtl =
+      TextEditingController(text: entry.secondaryKeys.join(', '));
+  final contentCtl = TextEditingController(text: entry.content);
+  bool constant = entry.constant;
+  // Wave 1.1 (F3): the SillyTavern-style keyword options. Defaults mirror the
+  // model's pre-1.1 defaults so an unchanged entry saves with no new fields.
+  LoreSelectiveLogic logic = entry.selectiveLogic;
+  bool? caseSensitive = entry.caseSensitive;
+  bool? matchWholeWords = entry.matchWholeWords;
+  bool useProbability = entry.useProbability;
+  int probability = entry.probability;
+  // 2026-07-13 (community request): per-entry character filter (ST parity).
+  final charFilterCtl =
+      TextEditingController(text: entry.characterFilterNames.join(', '));
+  bool characterFilterExclude = entry.characterFilterExclude;
+
+  // Tri-state (Default / On / Off) value helpers for the override toggles.
+  String triLabel(bool? v) => v == null ? 'Default' : (v ? 'On' : 'Off');
+  bool? triNext(bool? v) => v == null
+      ? true
+      : (v ? false : null); // Default -> On -> Off -> Default
+
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setState) {
+        final screenSize = MediaQuery.of(ctx).size;
+        final dialogWidth = (screenSize.width * 0.92).clamp(0.0, 560.0);
+        final dialogMaxHeight = screenSize.height * 0.88;
+        return AlertDialog(
+        backgroundColor: EmberColors.bgPanel,
+        title: Text(isNew ? 'New entry' : 'Edit entry'),
+        content: SizedBox(
+          width: dialogWidth,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: dialogMaxHeight),
+            child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: keysCtl,
+                  minLines: 2,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    labelText: 'Trigger keywords',
+                    helperText:
+                        'Comma-separated. Ignored if "constant" is on.',
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: secondaryCtl,
+                  minLines: 2,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    labelText: 'Secondary keywords (optional)',
+                    helperText:
+                        'Comma-separated. Combined with the logic below.',
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+                // The logic dropdown only matters when there are secondary
+                // keywords — show it then (with a hint otherwise).
+                if (secondaryCtl.text.trim().isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<LoreSelectiveLogic>(
+                    initialValue: logic,
+                    decoration: const InputDecoration(labelText: 'Logic'),
+                    items: const [
+                      DropdownMenuItem(
+                        value: LoreSelectiveLogic.andAny,
+                        child: Text('Any of these'),
+                      ),
+                      DropdownMenuItem(
+                        value: LoreSelectiveLogic.andAll,
+                        child: Text('All of these'),
+                      ),
+                      DropdownMenuItem(
+                        value: LoreSelectiveLogic.notAny,
+                        child: Text('None of these'),
+                      ),
+                      DropdownMenuItem(
+                        value: LoreSelectiveLogic.notAll,
+                        child: Text('Not all of these'),
+                      ),
+                    ],
+                    onChanged: (v) => setState(
+                        () => logic = v ?? LoreSelectiveLogic.andAny),
+                  ),
+                ] else
+                  Padding(
+                    padding: EdgeInsets.only(top: 6),
+                    child: Text(
+                      'Add secondary keywords to enable AND/NOT logic.',
+                      style: TextStyle(
+                          color: EmberColors.textDim, fontSize: 11),
+                    ),
+                  ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: contentCtl,
+                  minLines: 6,
+                  maxLines: 14,
+                  decoration: const InputDecoration(
+                    labelText: 'Content to inject',
+                  ),
+                ),
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  title: const Text('Always inject (constant)'),
+                  value: constant,
+                  activeColor: EmberColors.primary,
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  onChanged: (v) => setState(() => constant = v ?? false),
+                ),
+                // Matching overrides — tri-state so "Default" keeps today's
+                // behaviour (case-insensitive whole-word).
+                Row(
+                  children: [
+                    const Expanded(child: Text('Case sensitive')),
+                    TextButton(
+                      onPressed: () => setState(
+                          () => caseSensitive = triNext(caseSensitive)),
+                      child: Text(triLabel(caseSensitive)),
+                    ),
+                  ],
+                ),
+                Row(
+                  children: [
+                    const Expanded(child: Text('Match whole words')),
+                    TextButton(
+                      onPressed: () => setState(
+                          () => matchWholeWords = triNext(matchWholeWords)),
+                      child: Text(triLabel(matchWholeWords)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  title: const Text('Use trigger chance'),
+                  value: useProbability,
+                  activeThumbColor: EmberColors.primary,
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  onChanged: (v) => setState(() => useProbability = v),
+                ),
+                if (useProbability)
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Slider(
+                          value: probability.toDouble().clamp(0, 100),
+                          min: 0,
+                          max: 100,
+                          divisions: 100,
+                          label: '$probability%',
+                          activeColor: EmberColors.primary,
+                          onChanged: (v) =>
+                              setState(() => probability = v.round()),
+                        ),
+                      ),
+                      SizedBox(
+                        width: 44,
+                        child: Text(
+                          '$probability%',
+                          textAlign: TextAlign.end,
+                          style:
+                              TextStyle(color: EmberColors.textMid),
+                        ),
+                      ),
+                    ],
+                  ),
+                const SizedBox(height: 12),
+                // 2026-07-13 (community request): restrict the entry to
+                // specific characters (ST characterFilter parity). Empty =
+                // fires for everyone; the exclude toggle inverts the list.
+                TextField(
+                  controller: charFilterCtl,
+                  minLines: 1,
+                  maxLines: 2,
+                  decoration: const InputDecoration(
+                    labelText: 'Only for characters (optional)',
+                    helperText:
+                        'Comma-separated names. Empty = every character.',
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+                if (charFilterCtl.text.trim().isNotEmpty)
+                  SwitchListTile(
+                    title: const Text('Exclude these instead'),
+                    value: characterFilterExclude,
+                    activeThumbColor: EmberColors.primary,
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    onChanged: (v) =>
+                        setState(() => characterFilterExclude = v),
+                  ),
+              ],
+            ),
+          ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              entry
+                ..keys = keysCtl.text
+                    .split(',')
+                    .map((s) => s.trim())
+                    .where((s) => s.isNotEmpty)
+                    .toList()
+                ..secondaryKeys = secondaryCtl.text
+                    .split(',')
+                    .map((s) => s.trim())
+                    .where((s) => s.isNotEmpty)
+                    .toList()
+                ..content = contentCtl.text
+                ..constant = constant
+                ..selectiveLogic = logic
+                ..caseSensitive = caseSensitive
+                ..matchWholeWords = matchWholeWords
+                ..useProbability = useProbability
+                ..probability = probability.clamp(0, 100)
+                ..characterFilterNames = charFilterCtl.text
+                    .split(',')
+                    .map((s) => s.trim())
+                    .where((s) => s.isNotEmpty)
+                    .toList()
+                // An empty name list means "everyone" — a dangling exclude
+                // flag would then be meaningless; reset it so the JSON stays
+                // clean (both fields omit-at-default).
+                ..characterFilterExclude = charFilterCtl.text.trim().isEmpty
+                    ? false
+                    : characterFilterExclude;
+              if (isNew) {
+                lore.entries.add(entry);
+              }
+              store.updateLorebook(lore);
+              Navigator.pop(ctx);
+            },
+            child: Text(isNew ? 'Add' : 'Save'),
+          ),
+        ],
+      );
+      },
+    ),
+  );
+  // H-3: dispose the entry-editor controllers once the dialog closes.
+  keysCtl.dispose();
+  secondaryCtl.dispose();
+  contentCtl.dispose();
+  charFilterCtl.dispose();
+}

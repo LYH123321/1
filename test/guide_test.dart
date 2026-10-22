@@ -1,0 +1,413 @@
+// Guide (guided generations) — pure-function tests.
+//
+// Covers:
+//   • injectGuide() placement at both positions, the no-user-turn fallback,
+//     content-present-once, and the null/blank = no-op-without-mutation
+//     guarantee (the caller's list must never be touched).
+//   • GuideSettings toJson/fromJson round-trip + tolerant defaults.
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:pyre/models/models.dart';
+import 'package:pyre/services/chat_api.dart';
+import 'package:pyre/services/chat_prompt_builder.dart';
+
+void main() {
+  // A small representative turn list: system prompt, one user, one assistant,
+  // one final user turn (the message the model answers).
+  List<ChatTurn> sample() => [
+        ChatTurn('system', 'You are a helpful roleplay partner.'),
+        ChatTurn('user', 'Hi there.'),
+        ChatTurn('assistant', 'Hello!'),
+        ChatTurn('user', 'What do you do next?'),
+      ];
+
+  group('injectGuide', () {
+    test('systemNoteAtEnd appends one system turn at the end', () {
+      final turns = sample();
+      final out = injectGuide(
+          turns, 'be tense and brief', GuideInjectionPosition.systemNoteAtEnd);
+
+      expect(out.length, turns.length + 1);
+      expect(out.last.role, 'system');
+      expect(out.last.content, contains('be tense and brief'));
+      // Everything before the note is unchanged, in order.
+      for (var i = 0; i < turns.length; i++) {
+        expect(out[i].role, turns[i].role);
+        expect(out[i].content, turns[i].content);
+      }
+    });
+
+    test('beforeLastUserTurn inserts just before the LAST user turn', () {
+      final turns = sample();
+      final out = injectGuide(turns, 'have her hesitate first',
+          GuideInjectionPosition.beforeLastUserTurn);
+
+      expect(out.length, turns.length + 1);
+      // The note sits at index 3 (right before the final user turn).
+      final noteIdx = out.indexWhere((t) =>
+          t.role == 'system' && t.content.contains('have her hesitate first'));
+      expect(noteIdx, 3);
+      expect(out[noteIdx].role, 'system');
+      expect(out[noteIdx + 1].role, 'user');
+      expect(out[noteIdx + 1].content, 'What do you do next?');
+    });
+
+    test('beforeLastUserTurn with no user turn falls back to appending', () {
+      final turns = [
+        ChatTurn('system', 'sys'),
+        ChatTurn('assistant', 'a'),
+      ];
+      final out = injectGuide(
+          turns, 'steer it', GuideInjectionPosition.beforeLastUserTurn);
+
+      expect(out.length, turns.length + 1);
+      expect(out.last.role, 'system');
+      expect(out.last.content, contains('steer it'));
+    });
+
+    test('guide content appears exactly once', () {
+      final out = injectGuide(
+          sample(), 'mention the rain', GuideInjectionPosition.systemNoteAtEnd);
+      final hits =
+          out.where((t) => t.content.contains('mention the rain')).length;
+      expect(hits, 1);
+    });
+
+    test('null guide is a no-op and returns the SAME list instance', () {
+      final turns = sample();
+      final out = injectGuide(turns, null, GuideInjectionPosition.systemNoteAtEnd);
+      expect(identical(out, turns), isTrue);
+      expect(out.length, turns.length);
+    });
+
+    test('blank/whitespace guide is a no-op and returns the SAME list', () {
+      final turns = sample();
+      final out = injectGuide(
+          turns, '   \n  ', GuideInjectionPosition.beforeLastUserTurn);
+      expect(identical(out, turns), isTrue);
+      expect(out.length, turns.length);
+    });
+
+    test('does NOT mutate the caller\'s list (returns a new list)', () {
+      final turns = sample();
+      final before = turns.length;
+      final out = injectGuide(
+          turns, 'do a thing', GuideInjectionPosition.systemNoteAtEnd);
+      // Caller's list unchanged…
+      expect(turns.length, before);
+      // …and the returned list is a distinct instance.
+      expect(identical(out, turns), isFalse);
+      expect(out.length, before + 1);
+    });
+
+    test('formatGuideNote wraps + trims the raw guide', () {
+      final note = formatGuideNote('  speak softly  ');
+      expect(note, contains('speak softly'));
+      expect(note.contains('  speak softly  '), isFalse); // trimmed
+      expect(note.startsWith('['), isTrue);
+      expect(note.endsWith(']'), isTrue);
+    });
+  });
+
+  group('GuideSettings', () {
+    test('defaults: enabled true, end position, second person, mtime 0', () {
+      final g = GuideSettings();
+      expect(g.enabled, true);
+      expect(g.injectionPosition, GuideInjectionPosition.systemNoteAtEnd);
+      expect(g.defaultPerspective, GuidePerspective.second);
+      expect(g.mtime, 0);
+    });
+
+    test('toJson/fromJson round-trips every field', () {
+      final g = GuideSettings(
+        enabled: false,
+        injectionPosition: GuideInjectionPosition.beforeLastUserTurn,
+        defaultPerspective: GuidePerspective.third,
+        mtime: 12345,
+      );
+      final back = GuideSettings.fromJson(g.toJson());
+      expect(back.enabled, false);
+      expect(back.injectionPosition, GuideInjectionPosition.beforeLastUserTurn);
+      expect(back.defaultPerspective, GuidePerspective.third);
+      expect(back.mtime, 12345);
+    });
+
+    test('fromJson tolerates an empty / missing map (falls back to defaults)',
+        () {
+      final g = GuideSettings.fromJson(const <String, dynamic>{});
+      expect(g.enabled, true);
+      expect(g.injectionPosition, GuideInjectionPosition.systemNoteAtEnd);
+      expect(g.defaultPerspective, GuidePerspective.second);
+      expect(g.mtime, 0);
+    });
+
+    test('fromJson tolerates unknown enum strings (falls back to defaults)', () {
+      final g = GuideSettings.fromJson(const {
+        'enabled': true,
+        'injectionPosition': 'garbage',
+        'defaultPerspective': 'nonsense',
+      });
+      expect(g.injectionPosition, GuideInjectionPosition.systemNoteAtEnd);
+      expect(g.defaultPerspective, GuidePerspective.second);
+    });
+
+    test('enum name helpers are stable strings', () {
+      expect(
+          guideInjectionPositionToName(GuideInjectionPosition.systemNoteAtEnd),
+          'systemNoteAtEnd');
+      expect(
+          guideInjectionPositionToName(
+              GuideInjectionPosition.beforeLastUserTurn),
+          'beforeLastUserTurn');
+      expect(guidePerspectiveToName(GuidePerspective.first), 'first');
+      expect(guidePerspectiveToName(GuidePerspective.second), 'second');
+      expect(guidePerspectiveToName(GuidePerspective.third), 'third');
+    });
+  });
+
+  // ── Group awareness (owner 2026-07: "Impersonate Me só está pegando um
+  // personagem") — in a group chat the instruction must name EVERY member,
+  // not just the primary, so the written message can engage the whole scene.
+  group('buildImpersonationPrompt — group chat', () {
+    test('>1 member: forbidden line + scene roster name every member', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        memberNames: ['Vesna', 'Talia', 'Orin'],
+      );
+      // The scene roster line tells the model everyone is present.
+      expect(p, contains('Vesna, Talia, and Orin'));
+      // The forbidden line covers ALL members, not just the primary.
+      expect(p, contains('Vesna, Talia, or Orin'));
+      expect(p, isNot(contains('from Vesna or any NPC')));
+    });
+
+    test('single member (or none passed) is byte-identical to before', () {
+      final classic = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+      );
+      final singleRoster = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        memberNames: ['Vesna'],
+      );
+      expect(singleRoster, classic);
+      expect(classic, contains('from Vesna or any NPC'));
+    });
+
+    test('preset override: {{char}} becomes the joined member names', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        memberNames: ['Vesna', 'Talia'],
+        presetImpersonationPrompt: 'Reply to {{char}} as {{user}}.',
+      );
+      expect(p, contains('Reply to Vesna, Talia as Ren.'));
+    });
+  });
+
+  // ── Persona party (owner 2026-07: Impersonate "só funciona para ele") —
+  // in a persona PARTY the message represents the whole group, so the OOC
+  // turn must allow every persona to act, not lock to the primary (which
+  // contradicted the collective instruction already in the system context).
+  group('buildImpersonationPrompt — persona party', () {
+    test('>1 persona: writes for the group, any member may act', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Orion',
+        speakerName: 'Vesna',
+        personaNames: ['Orion', 'Anastasia'],
+      );
+      // The joined label drives the perspective + allowed lines.
+      expect(p, contains("Orion and Anastasia's perspective"));
+      expect(p, contains("Orion and Anastasia's dialogue"));
+      // Explicit group line: one message, either or all of them may act.
+      expect(p, contains('either or all of them'));
+      // The primary-only framing is gone.
+      expect(p, isNot(contains("from Orion's perspective")));
+    });
+
+    test('single persona (or none passed) is byte-identical to before', () {
+      final classic = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+      );
+      final single = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        personaNames: ['Ren'],
+      );
+      expect(single, classic);
+      expect(classic, contains("from Ren's perspective"));
+    });
+
+    test('preset override: {{user}} becomes the joined persona names', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Orion',
+        speakerName: 'Vesna',
+        personaNames: ['Orion', 'Anastasia'],
+        presetImpersonationPrompt: 'Write as {{user}} replying to {{char}}.',
+      );
+      expect(p, contains('Write as Orion and Anastasia replying to Vesna.'));
+    });
+
+    test(
+        'group formatting: GOOD example uses the REAL roster names, quoted '
+        'dialogue per member, no-merge + no-bare-dialogue rules', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Orion',
+        speakerName: 'Vesna',
+        personaNames: ['Orion', 'Anastasia'],
+      );
+      // The example is built from the actual roster, one beat each:
+      // a name-anchored action paragraph + a QUOTED dialogue paragraph.
+      expect(p, contains('*Orion glances at the door, leaning forward.*'));
+      expect(p, contains('"Did you hear that?"'));
+      expect(p, contains('*Anastasia crosses their arms, unimpressed.*'));
+      expect(p, contains('"It was nothing. Keep your voice down."'));
+      // Group-specific hard rules.
+      expect(p, contains('NEVER merge two members into one paragraph'));
+      expect(p, contains('bare/unquoted dialogue is forbidden'));
+      // The single-persona example ("She crosses her arms") is replaced.
+      expect(p, isNot(contains('*She crosses her arms, eyes narrowing.*')));
+    });
+  });
+
+  // ── Guided impersonation prompt assembly (Action 3 "Guide my message") ──
+  group('buildImpersonationPrompt', () {
+    test('no outline + no perspective = classic Impersonate Me (unchanged)',
+        () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+      );
+      // Still the default OOC impersonation prompt: persona-only voice, the
+      // forbidden-NPC rules, formatting guidance, no thinking-out-loud.
+      expect(p, startsWith('[OOC:'));
+      expect(p, contains("Write the next message from Ren's perspective"));
+      expect(p, contains('FORBIDDEN in this reply'));
+      // No outline rider and no perspective directive when neither is given.
+      expect(p.contains('EXPAND this rough outline'), isFalse);
+      expect(p.contains('Write it in '), isFalse);
+    });
+
+    test('outline present → expand rider with the verbatim outline', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        outline: 'refuse the offer but leave the door open',
+      );
+      expect(p, contains('EXPAND this rough outline from Ren'));
+      expect(p, contains('refuse the offer but leave the door open'));
+      // Keeps intent / does not act for others.
+      expect(p, contains("keep Ren's intent"));
+      expect(p, contains('do NOT speak or act for anyone else'));
+    });
+
+    test('blank/whitespace outline behaves like no outline', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        outline: '   \n  ',
+      );
+      expect(p.contains('EXPAND this rough outline'), isFalse);
+    });
+
+    test('each perspective injects the right directive', () {
+      final first = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        perspective: GuidePerspective.first,
+      );
+      expect(first, contains('Write it in FIRST person'));
+
+      final second = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        perspective: GuidePerspective.second,
+      );
+      expect(second, contains('Write it in SECOND person'));
+
+      final third = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        perspective: GuidePerspective.third,
+      );
+      expect(third, contains('Write it in THIRD person'));
+    });
+
+    test('outline × perspective combine in one prompt', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        outline: 'storm off in a huff',
+        perspective: GuidePerspective.third,
+      );
+      expect(p, contains('storm off in a huff'));
+      expect(p, contains('Write it in THIRD person'));
+    });
+
+    test('preset override is honoured verbatim with names substituted', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        presetImpersonationPrompt:
+            'Speak as {{user}} replying to {{char}} now.',
+      );
+      expect(p, contains('Speak as Ren replying to Vesna now.'));
+      // The built-in default body is NOT used when a preset override is set.
+      expect(p.contains('FORBIDDEN in this reply'), isFalse);
+    });
+
+    test('preset override still picks up the outline + perspective riders', () {
+      final p = buildImpersonationPrompt(
+        personaName: 'Ren',
+        speakerName: 'Vesna',
+        presetImpersonationPrompt: 'Be {{user}}.',
+        outline: 'apologise sincerely',
+        perspective: GuidePerspective.first,
+      );
+      expect(p, startsWith('Be Ren.'));
+      expect(p, contains('apologise sincerely'));
+      expect(p, contains('Write it in FIRST person'));
+    });
+
+    test('guidePerspectivePhrase names the persona', () {
+      expect(guidePerspectivePhrase(GuidePerspective.first, 'Ren'),
+          contains('Ren'));
+      expect(guidePerspectivePhrase(GuidePerspective.third, 'Ren'),
+          contains('Ren'));
+    });
+  });
+
+  // 2026-07-03 review: the examples nudge must cover EVERY persona in a
+  // persona party — it used to name only the primary (same family as the
+  // personaNames impersonate bug; one shared path covers Impersonate AND
+  // Guide my message). Single-name output stays byte-identical to the
+  // original hardcoded nudge.
+  group('buildExamplesNudge', () {
+    test('no personas with examples → no nudge', () {
+      expect(buildExamplesNudge(const []), '');
+      expect(buildExamplesNudge(const ['', '  ']), '');
+    });
+
+    test('single persona → byte-identical to the original nudge', () {
+      expect(
+        buildExamplesNudge(const ['Ren']),
+        '\n\nMatch Ren\'s dialogue cadence and voice from the '
+        '"Ren\'s dialogue style" examples shown in your '
+        'system context. Same diction, same sentence length, same '
+        'kind of action beats.',
+      );
+    });
+
+    test('persona party → every member with examples is named', () {
+      final nudge = buildExamplesNudge(const ['Orion', 'Anastasia']);
+      expect(nudge, contains('"Orion\'s dialogue style"'));
+      expect(nudge, contains('"Anastasia\'s dialogue style"'));
+      expect(nudge, contains('own voice'),
+          reason: 'the group nudge must ask for per-member voices, not a '
+              'single blended one');
+    });
+  });
+}

@@ -1,0 +1,1699 @@
+import 'dart:convert';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+
+import '../models/models.dart';
+import '../services/st_preset_import.dart';
+import '../state/app_store.dart';
+import '../theme.dart';
+import '../widgets/confirm_dialog.dart';
+import '../widgets/how_it_works_card.dart';
+import '../widgets/menu_sheet.dart';
+import '../widgets/setting_slider.dart';
+
+class PresetsScreen extends StatelessWidget {
+  const PresetsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<AppStore>();
+    // Filter out tombstoned (deleted:true) presets so a stray synced-in
+    // tombstone can't render as a phantom row (mirrors regex_rules_screen).
+    final visible =
+        store.visiblePresets.where((p) => !p.deleted).toList(growable: false);
+    // The locked default is never listed and never previewable.
+    // The "Default" pill on the active row only shows when the locked default
+    // is actually selected — no other surface exposes its contents.
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Presets'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.file_upload_outlined),
+            tooltip: 'Import SillyTavern preset',
+            onPressed: () => _importSillyTavern(context),
+          ),
+          IconButton(
+            icon: const Icon(Icons.add),
+            tooltip: 'New preset',
+            onPressed: () => _editPreset(context, null),
+          ),
+        ],
+      ),
+      // Wave CY.18.192: the global sampling defaults (max tokens,
+      // temperature, top-p, top-k) used to live on the now-deleted
+      // Model Settings screen. They moved here, into a "Default
+      // generation" card at the top — these are the fallback values
+      // applied whenever a preset leaves a field blank (the per-preset
+      // overrides live inside the preset editor below). The card scrolls
+      // with the list so a long preset list doesn't pin it off-screen.
+      //
+      // Perf-at-scale (audit 2026-06-05 #8): virtualized via ListView.builder
+      // so a big imported preset library (ST users hit 30+) doesn't build
+      // EVERY preset card up-front. The fixed header widgets (explainer +
+      // Default generation card + section label) are indices 0..N-1; the
+      // preset cards build lazily after them.
+      body: _buildList(visible),
+    );
+  }
+
+  Widget _buildList(List<Preset> visible) {
+    final header = <Widget>[
+      // ── How it works ──────────────────────────────────────────────
+      // Shared explainer card (collapsed by default), matching the
+      // Long-term Memory / Live Sheet / Script screens.
+      const HowItWorksCard(
+        title: 'How presets work',
+        subtitle: 'What a preset is, and how to switch.',
+        sections: [
+          HowItWorksSection('What it is', [
+            HowItWorksBlock.paragraph(
+                'A **preset** bundles the prompt structure Pyre sends '
+                'to the model — the main system prompt, an optional '
+                'post-history reminder (the jailbreak / prefill slot), '
+                'and the impersonate & continue nudges — together with '
+                'optional **sampling overrides** (temperature, top-p, '
+                'top-k, penalties).'),
+            HowItWorksBlock.paragraph(
+                'A sampling field left blank falls back to your global '
+                '**Default generation** values (the card below). Only '
+                'the fields you fill override the default.'),
+          ]),
+          HowItWorksSection('The default preset', [
+            HowItWorksBlock.bullet(
+                'The built-in **Pyre Default** is locked — it can\'t be '
+                'edited or deleted, so there\'s always a known-good '
+                'fallback.'),
+            HowItWorksBlock.bullet(
+                'To change it, open its menu and pick **Copy '
+                '(editable)** to fork it into a preset you can modify '
+                'freely.'),
+          ]),
+          HowItWorksSection('Building & importing', [
+            HowItWorksBlock.bullet(
+                'Tap **+** to author a preset from scratch, or fork the '
+                'default with Copy.'),
+            HowItWorksBlock.bullet(
+                '**Import a SillyTavern preset** with the upload button '
+                '— its prompts are merged and its post-history block is '
+                'captured.'),
+            HowItWorksBlock.bullet(
+                'Each preset can also **View details** or **Export '
+                'JSON** from its menu.'),
+          ]),
+          HowItWorksSection('Switching', [
+            HowItWorksBlock.bullet(
+                'Tap a preset to make it **active** — the active one is '
+                'used for every chat.'),
+            HowItWorksBlock.bullet(
+                'You can also **quick-switch** the active preset from '
+                'the in-chat kebab menu without leaving the chat.'),
+          ]),
+        ],
+      ),
+      const SizedBox(height: 8),
+      const _DefaultGenerationCard(),
+      const SizedBox(height: 16),
+      const _SectionLabel('PRESETS'),
+      const SizedBox(height: 8),
+    ];
+
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      itemCount: header.length + visible.length,
+      itemBuilder: (context, i) {
+        if (i < header.length) return header[i];
+        final p = visible[i - header.length];
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: _PresetCard(preset: p),
+        );
+      },
+    );
+  }
+}
+
+/// One preset row. Extracted from the inline `Builder` so the list can build
+/// lazily; reads the active id from the store so only this card rebuilds when
+/// the active preset changes.
+class _PresetCard extends StatelessWidget {
+  final Preset preset;
+  const _PresetCard({required this.preset});
+
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<AppStore>();
+    final p = preset;
+    final active = p.id == store.activePresetId;
+    return Card(
+      child: ListTile(
+        leading: CircleAvatar(
+          radius: 20,
+          backgroundColor: p.locked
+              ? EmberColors.primary.withValues(alpha: 0.22)
+              : EmberColors.bgElevated,
+          child: Icon(
+            p.locked ? Icons.lock_outline : Icons.layers_outlined,
+            size: 18,
+            color: p.locked
+                ? EmberColors.primary
+                : (active ? EmberColors.primary : EmberColors.textMid),
+          ),
+        ),
+        title: Row(
+          children: [
+            Flexible(
+              child: Text(p.name,
+                  style: const TextStyle(fontWeight: FontWeight.w600)),
+            ),
+            if (active) ...[
+              const SizedBox(width: 6),
+              _Pill(label: 'ACTIVE'),
+            ],
+            if (p.locked) ...[
+              const SizedBox(width: 6),
+              _Pill(label: 'DEFAULT'),
+            ],
+          ],
+        ),
+        subtitle: Text(
+          p.locked
+              ? 'Built-in preset · tuned for creative roleplay'
+              : _previewLine(p),
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(color: EmberColors.textMid),
+        ),
+        trailing: IconButton(
+          icon: Icon(Icons.more_vert, color: EmberColors.textMid),
+          tooltip: 'Preset actions',
+          onPressed: () => _openPresetKebab(context, p),
+        ),
+        onTap: () => store.setActivePreset(p.id),
+      ),
+    );
+  }
+}
+
+/// Wave CY.18.192: small uppercase section label, matches the inline
+/// header style used elsewhere (Creator, Chat Settings).
+class _SectionLabel extends StatelessWidget {
+  final String text;
+  const _SectionLabel(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: Text(
+        text,
+        style: TextStyle(
+          color: EmberColors.primary,
+          fontWeight: FontWeight.w700,
+          fontSize: 11,
+          letterSpacing: 1.2,
+        ),
+      ),
+    );
+  }
+}
+
+/// Wave CY.18.192: global sampling defaults, moved here from the deleted
+/// Model Settings screen. These bind to the global `ModelSettings` — the
+/// fallback used by `_samplingPayload` (chat_api.dart) whenever the active
+/// preset leaves a field null (`preset?.x ?? settings.x`). The per-preset
+/// overrides still live in the preset editor; this card is the base layer.
+///
+/// Stateful so it can hold transient per-slider drag values, keeping the
+/// thumb smooth during a drag without persisting on every tick (mirror of
+/// the opacity-slider pattern in customize_chat_sheet.dart). Live values
+/// are always read from `store.modelSettings` — no persistent draft that
+/// could go stale when modelSettings changes externally (backup/merge
+/// restore, factory reset, LAN sync pull).
+class _DefaultGenerationCard extends StatefulWidget {
+  const _DefaultGenerationCard();
+
+  @override
+  State<_DefaultGenerationCard> createState() => _DefaultGenerationCardState();
+}
+
+class _DefaultGenerationCardState extends State<_DefaultGenerationCard> {
+  // Transient per-slider drag values. Non-null only while the user is
+  // actively dragging that slider; cleared + committed on onChangeEnd.
+  double? _dragMaxTokens;
+  double? _dragTemp;
+  double? _dragTopP;
+  double? _dragTopK;
+
+  @override
+  Widget build(BuildContext context) {
+    // The active preset can OVERRIDE any of these sampling values when
+    // sending the request — we show a "PRESET OVERRIDE" badge on each
+    // slider whose preset value differs, so the user isn't confused
+    // about why their default "isn't taking effect".
+    final store = context.watch<AppStore>();
+    final ms = store.modelSettings;
+    final preset = store.activePreset;
+
+    // Effective display value: transient drag value if dragging, else live.
+    final dispMaxTokens = _dragMaxTokens ?? ms.maxTokens.toDouble();
+    final dispTemp      = _dragTemp      ?? ms.temperature;
+    final dispTopP      = _dragTopP      ?? ms.topP;
+    final dispTopK      = _dragTopK      ?? ms.topK.toDouble();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const _SectionLabel('DEFAULT GENERATION'),
+        Padding(
+          padding: EdgeInsets.fromLTRB(4, 4, 4, 0),
+          child: Text(
+            'Defaults used when a preset leaves a field blank. '
+            'Edit a preset to override per-preset.',
+            style: TextStyle(
+              color: EmberColors.textMid,
+              fontSize: 12,
+              height: 1.4,
+            ),
+          ),
+        ),
+        if (preset != null &&
+            [
+              preset.temperature,
+              preset.topP,
+              preset.topK,
+              preset.maxTokens,
+            ].any((v) => v != null))
+          Card(
+            margin: const EdgeInsets.symmetric(vertical: 6),
+            color: EmberColors.bgElevated,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline,
+                      size: 18, color: EmberColors.primary),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Preset "${preset.name}" overrides some of these values when active. Overridden sliders show the preset value as the effective one.',
+                      style: TextStyle(
+                        color: EmberColors.textMid,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        SliderCard(
+          label: 'Max Response Tokens',
+          subtitle:
+              'Maximum tokens in a response; too small may cause truncation.',
+          value: dispMaxTokens,
+          min: 64,
+          max: 4096,
+          divisions: 63,
+          display: dispMaxTokens.round().toString(),
+          onChanged: (v) => setState(() => _dragMaxTokens = v),
+          onChangeEnd: (v) {
+            final updated = store.modelSettings.copy()
+              ..maxTokens = v.round();
+            store.updateModelSettings(updated);
+            setState(() => _dragMaxTokens = null);
+          },
+          // Only mark as overridden when the preset value DIFFERS from
+          // the default — identical values would just confuse the user.
+          overrideValue: (preset?.maxTokens != null &&
+                  preset!.maxTokens != ms.maxTokens)
+              ? preset.maxTokens.toString()
+              : null,
+        ),
+        SliderCard(
+          label: 'Temperature',
+          subtitle: 'Script-adherent  ~  Wildly imaginative',
+          value: dispTemp,
+          min: 0,
+          max: 2,
+          divisions: 40,
+          display: dispTemp.toStringAsFixed(2),
+          onChanged: (v) => setState(() => _dragTemp = v),
+          onChangeEnd: (v) {
+            final updated = store.modelSettings.copy()
+              ..temperature = v;
+            store.updateModelSettings(updated);
+            setState(() => _dragTemp = null);
+          },
+          overrideValue: (preset?.temperature != null &&
+                  (preset!.temperature! - ms.temperature).abs() > 0.001)
+              ? preset.temperature!.toStringAsFixed(2)
+              : null,
+        ),
+        SliderCard(
+          label: 'Top-P',
+          subtitle: 'Personality Single-faceted  ~  Multi-faceted',
+          value: dispTopP,
+          min: 0,
+          max: 1,
+          divisions: 20,
+          display: dispTopP.toStringAsFixed(2),
+          onChanged: (v) => setState(() => _dragTopP = v),
+          onChangeEnd: (v) {
+            final updated = store.modelSettings.copy()
+              ..topP = v;
+            store.updateModelSettings(updated);
+            setState(() => _dragTopP = null);
+          },
+          overrideValue: (preset?.topP != null &&
+                  (preset!.topP! - ms.topP).abs() > 0.001)
+              ? preset.topP!.toStringAsFixed(2)
+              : null,
+        ),
+        SliderCard(
+          label: 'Top-K',
+          subtitle: 'Dialogue Style Fixed  ~  Variable  (0 = disabled)',
+          value: dispTopK,
+          min: 0,
+          max: 100,
+          divisions: 100,
+          display: dispTopK.round().toString(),
+          onChanged: (v) => setState(() => _dragTopK = v),
+          onChangeEnd: (v) {
+            final updated = store.modelSettings.copy()
+              ..topK = v.round();
+            store.updateModelSettings(updated);
+            setState(() => _dragTopK = null);
+          },
+          overrideValue: (preset?.topK != null && preset!.topK != ms.topK)
+              ? preset.topK.toString()
+              : null,
+        ),
+      ],
+    );
+  }
+}
+
+String _previewLine(Preset p) {
+  final src = p.mainPrompt.trim();
+  if (src.isEmpty) return '(no system prompt)';
+  final flat = src.replaceAll(RegExp(r'\s+'), ' ');
+  if (p.source == 'sillytavern') return 'ST preset · $flat';
+  return flat;
+}
+
+class _Pill extends StatelessWidget {
+  final String label;
+  const _Pill({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: EmberColors.primary.withValues(alpha: 0.22),
+        borderRadius: BorderRadius.circular(4),
+        border:
+            Border.all(color: EmberColors.primary.withValues(alpha: 0.5)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: EmberColors.primary,
+          fontSize: 9,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.6,
+        ),
+      ),
+    );
+  }
+}
+
+/// 2026-07-13 (owner design pass): tiny section label for the long kebab
+/// menus (≥7 items) — see the twin `_menuSectionLabel` in
+/// characters_screen.dart for the pattern's provenance (chat_settings
+/// `_sectionLabel` text style + export-sheet header placement).
+Widget _menuSectionLabel(String text) => Padding(
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 4),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          text.toUpperCase(),
+          style: TextStyle(
+            color: EmberColors.textDim,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.6,
+          ),
+        ),
+      ),
+    );
+
+Future<void> _openPresetKebab(BuildContext context, Preset p) async {
+  final store = context.read<AppStore>();
+  final messenger = ScaffoldMessenger.of(context);
+  // 2026-07-13 (owner design pass): items grouped under section labels
+  // (USE / EDIT / EXPORT); Edit joins the EDIT section next to Copy, and
+  // Delete moves behind a divider like every other kebab. Same actions,
+  // same handlers. This menu had no didactic subtitles to cut.
+  await showMenuSheet<void>(
+    context,
+    itemsBuilder: (sheet) => [
+          _menuSectionLabel('Use'),
+          ListTile(
+            leading: Icon(Icons.check_circle_outline,
+                color: EmberColors.primary),
+            title: const Text('Select (activate now)'),
+            onTap: () {
+              Navigator.pop(sheet);
+              store.setActivePreset(p.id);
+              messenger.showSnackBar(
+                SnackBar(content: Text('"${p.name}" is now active.')),
+              );
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.vertical_align_top),
+            title: const Text('Move to top'),
+            onTap: () {
+              Navigator.pop(sheet);
+              final all = [...store.presets]..removeWhere((x) => x.id == p.id);
+              store.presets
+                ..clear()
+                ..addAll([p, ...all]);
+              store.notifyAndPersist();
+            },
+          ),
+          _menuSectionLabel('Edit'),
+          // Wave CY.18.10: View / Copy / Export are now available for
+          // ALL presets including the Pyre Default. The pre-Play-Store
+          // "sealed" treatment is gone — the contents are visible (in
+          // read-only View) and clonable so users can fork the default
+          // as a starting point. Edit and Delete remain locked-only-off
+          // so the original default stays intact as a reference point.
+          ListTile(
+            leading: const Icon(Icons.visibility_outlined),
+            title: const Text('View details'),
+            onTap: () {
+              Navigator.pop(sheet);
+              _showPresetDetails(context, p);
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.copy),
+            title: const Text('Copy (editable)'),
+            onTap: () {
+              Navigator.pop(sheet);
+              final clone = Preset(
+                id: newId('preset'),
+                name: '${p.name} (copy)',
+                mainPrompt: p.mainPrompt,
+                postHistoryInstructions: p.postHistoryInstructions,
+                impersonationPrompt: p.impersonationPrompt,
+                continueNudgePrompt: p.continueNudgePrompt,
+                startReplyWith: p.startReplyWith,
+                temperature: p.temperature,
+                topP: p.topP,
+                topK: p.topK,
+                maxTokens: p.maxTokens,
+                frequencyPenalty: p.frequencyPenalty,
+                presencePenalty: p.presencePenalty,
+                minP: p.minP,
+                topA: p.topA,
+                repetitionPenalty: p.repetitionPenalty,
+                dryMultiplier: p.dryMultiplier,
+                dryBase: p.dryBase,
+                dryAllowedLength: p.dryAllowedLength,
+                bannedWords: List<String>.from(p.bannedWords),
+                // Pyre 1.1: a modular preset must clone its toggleable blocks
+                // too (deep copy — each block is a mutable object), or the
+                // copy would silently flatten to mainPrompt.
+                promptBlocks: [
+                  for (final b in p.promptBlocks)
+                    PromptBlock(
+                      id: newId('block'),
+                      name: b.name,
+                      content: b.content,
+                      enabled: b.enabled,
+                      role: b.role,
+                      position: b.position,
+                      depth: b.depth,
+                    ),
+                ],
+              );
+              store.addPreset(clone);
+              messenger.showSnackBar(
+                const SnackBar(content: Text('Copied as editable preset.')),
+              );
+            },
+          ),
+          // Edit and Delete remain hidden for the locked preset so
+          // there's always a known-good fallback the user can copy
+          // from. To "edit" the default, copy it and edit the clone.
+          if (!p.locked)
+            ListTile(
+              leading: const Icon(Icons.edit_outlined),
+              title: const Text('Edit'),
+              onTap: () {
+                Navigator.pop(sheet);
+                _editPreset(context, p);
+              },
+            ),
+          _menuSectionLabel('Export'),
+          ListTile(
+            leading: const Icon(Icons.file_download_outlined),
+            title: const Text('Export JSON'),
+            onTap: () async {
+              Navigator.pop(sheet);
+              final json = const JsonEncoder.withIndent('  ')
+                  .convert(p.toJson());
+              await Clipboard.setData(ClipboardData(text: json));
+              messenger.showSnackBar(
+                const SnackBar(content: Text('Preset JSON copied.')),
+              );
+            },
+          ),
+          if (!p.locked) Divider(color: EmberColors.stroke),
+          if (!p.locked)
+            ListTile(
+              leading: Icon(Icons.delete_outline,
+                  color: EmberColors.danger),
+              title: Text('Delete',
+                  style: TextStyle(color: EmberColors.danger)),
+              onTap: () async {
+                Navigator.pop(sheet);
+                final ok = await confirmDelete(
+                  context,
+                  title: 'Delete "${p.name}"?',
+                  message:
+                      'The preset will be removed. Chats using it will fall back to the default preset.',
+                );
+                if (!ok) return;
+                store.removePreset(p.id);
+              },
+            ),
+        ],
+  );
+}
+
+/// Wave CY.18.10: read-only viewer for any preset (especially the
+/// locked default, which has no other surface to expose its
+/// contents). Renders each field as a labelled, selectable text
+/// block. The user can long-press to copy individual sections.
+Future<void> _showPresetDetails(BuildContext context, Preset p) async {
+  await Navigator.of(context).push(
+    MaterialPageRoute(builder: (_) => _PresetDetailsScreen(preset: p)),
+  );
+}
+
+/// Wave CY.18.24: was a StatelessWidget that captured the Preset by
+/// value — meaning a backup restore (or any other external mutation)
+/// while this screen was on top showed STALE data until pop+reopen.
+/// Now reads the live preset from the store on every build by id,
+/// falling back to the last-known snapshot if the preset was deleted
+/// while detail was open. Watches AppStore so writes anywhere refresh.
+class _PresetDetailsScreen extends StatelessWidget {
+  final Preset preset;
+  const _PresetDetailsScreen({required this.preset});
+
+  /// Resolve the live preset from the store; fall back to the
+  /// snapshot we were constructed with if it's gone (e.g. backup
+  /// restore wiped the list mid-view).
+  Preset _live(AppStore store) {
+    for (final p in store.presets) {
+      if (p.id == preset.id) return p;
+    }
+    return preset;
+  }
+
+  Widget _section(String title, String? value, {bool monospace = true}) {
+    if (value == null || value.trim().isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            title.toUpperCase(),
+            style: TextStyle(
+              color: EmberColors.primary,
+              fontWeight: FontWeight.w700,
+              fontSize: 11,
+              letterSpacing: 1.1,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: EmberColors.bgElevated,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: EmberColors.stroke, width: 1),
+            ),
+            child: SelectableText(
+              value,
+              style: TextStyle(
+                color: EmberColors.textHigh,
+                fontSize: 12,
+                height: 1.45,
+                fontFamily: monospace ? 'monospace' : null,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _samplingRowFor(BuildContext context, Preset p) {
+    final samp = <String, dynamic>{
+      'temperature': p.temperature,
+      'top_p': p.topP,
+      'top_k': p.topK,
+      'max_tokens': p.maxTokens,
+      'frequency_penalty': p.frequencyPenalty,
+      'presence_penalty': p.presencePenalty,
+      'min_p': p.minP,
+      'top_a': p.topA,
+      'repetition_penalty': p.repetitionPenalty,
+      'dry_multiplier': p.dryMultiplier,
+      'dry_base': p.dryBase,
+      'dry_allowed_length': p.dryAllowedLength,
+      if (p.bannedWords.isNotEmpty) 'banned_words': p.bannedWords.join(', '),
+    }..removeWhere((_, v) => v == null);
+    if (samp.isEmpty) return const SizedBox.shrink();
+    final lines =
+        samp.entries.map((e) => '${e.key}: ${e.value}').join('\n');
+    return _section('Sampling overrides', lines);
+  }
+
+  /// Read-only render of a modular preset's prompt blocks: one labelled row per
+  /// block (name + on/off + position) above its content. Mirrors `_section`'s
+  /// look; no switches/edit (this is the details viewer, not the editor).
+  Widget _blocksSection(Preset p) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            'PROMPT BLOCKS',
+            style: TextStyle(
+              color: EmberColors.primary,
+              fontWeight: FontWeight.w700,
+              fontSize: 11,
+              letterSpacing: 1.1,
+            ),
+          ),
+          const SizedBox(height: 6),
+          for (final b in p.promptBlocks)
+            Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: EmberColors.bgElevated,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: EmberColors.stroke, width: 1),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        b.enabled
+                            ? Icons.check_circle
+                            : Icons.radio_button_unchecked,
+                        size: 16,
+                        color: b.enabled
+                            ? EmberColors.success
+                            : EmberColors.textDim,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          b.name.trim().isEmpty ? '(unnamed block)' : b.name,
+                          style: TextStyle(
+                            color: b.enabled
+                                ? EmberColors.textHigh
+                                : EmberColors.textDim,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                      ..._blockMetaChips(b),
+                    ],
+                  ),
+                  if (b.content.trim().isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    SelectableText(
+                      b.content,
+                      style: TextStyle(
+                        color: EmberColors.textMid,
+                        fontSize: 12,
+                        height: 1.45,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<AppStore>();
+    final live = _live(store);
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Preset details'),
+        actions: [
+          if (live.locked)
+            Padding(
+              padding: EdgeInsets.symmetric(horizontal: 12),
+              child: Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.lock_outline,
+                        size: 14, color: EmberColors.primary),
+                    SizedBox(width: 4),
+                    Text(
+                      'READ-ONLY',
+                      style: TextStyle(
+                        color: EmberColors.primary,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 1.1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  live.name,
+                  style: const TextStyle(
+                      fontSize: 18, fontWeight: FontWeight.w700),
+                ),
+              ),
+              if (live.locked)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: EmberColors.primary.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    'DEFAULT',
+                    style: TextStyle(
+                      color: EmberColors.primary,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.0,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          if (live.locked) ...[
+            const SizedBox(height: 6),
+            Text(
+              'The built-in default — sealed against edits and deletion '
+              'so it stays as a known-good fallback. Use "Copy '
+              '(editable)" from the kebab to fork it into a custom '
+              'preset you can modify freely.',
+              style: TextStyle(
+                color: EmberColors.textMid,
+                fontSize: 12,
+                height: 1.4,
+              ),
+            ),
+          ],
+          const SizedBox(height: 18),
+          // Pyre 1.1: a modular preset shows its toggleable blocks (read-only)
+          // instead of the flat Main prompt; a flat preset shows Main as before.
+          if (live.promptBlocks.isNotEmpty)
+            _blocksSection(live)
+          else
+            _section('Main prompt', live.mainPrompt),
+          _section('Post-history instructions',
+              live.postHistoryInstructions),
+          _section('Impersonate prompt', live.impersonationPrompt),
+          _section('Continue nudge', live.continueNudgePrompt),
+          _samplingRowFor(context, live),
+        ],
+      ),
+    );
+  }
+}
+
+Future<void> _importSillyTavern(BuildContext context) async {
+  final store = context.read<AppStore>();
+  final messenger = ScaffoldMessenger.of(context);
+  try {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['json'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final bytes = result.files.single.bytes;
+    if (bytes == null) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Could not read file bytes.')),
+      );
+      return;
+    }
+    final text = utf8.decode(bytes);
+    final imported = parseSillyTavernPreset(text);
+    store.addPreset(imported.preset);
+    store.setActivePreset(imported.preset.id);
+    final parts = <String>['${imported.promptCount} prompts merged'];
+    if (imported.preset.postHistoryInstructions.trim().isNotEmpty) {
+      parts.add('post-history block captured');
+    }
+    if (imported.preset.impersonationPrompt != null) {
+      parts.add('impersonate override');
+    }
+    if (imported.preset.continueNudgePrompt != null) {
+      parts.add('continue override');
+    }
+    if (imported.skipped.isNotEmpty) {
+      parts.add('skipped: ${imported.skipped.join(", ")}');
+    }
+    messenger.showSnackBar(SnackBar(
+      duration: const Duration(seconds: 6),
+      content: Text(
+        'Imported "${imported.preset.name}" — ${parts.join(" · ")}',
+      ),
+    ));
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('Import failed: $e')));
+  }
+}
+
+Future<void> _editPreset(BuildContext context, Preset? existing) async {
+  final store = context.read<AppStore>();
+  // Identity + prompts
+  final nameCtl = TextEditingController(text: existing?.name ?? 'New preset');
+  final mainCtl = TextEditingController(text: existing?.mainPrompt ?? '');
+  final postCtl =
+      TextEditingController(text: existing?.postHistoryInstructions ?? '');
+  final impCtl =
+      TextEditingController(text: existing?.impersonationPrompt ?? '');
+  final cntCtl =
+      TextEditingController(text: existing?.continueNudgePrompt ?? '');
+  // 2026-07-04 (Gui approved): prefill.
+  final startCtl =
+      TextEditingController(text: existing?.startReplyWith ?? '');
+
+  // Sampling — every field is an OPTIONAL override of the global
+  // "Default generation" defaults (the card at the top of this screen).
+  // Empty string means "use the user's global default".
+  String fmt(num? v) => v == null ? '' : v.toString();
+  final tempCtl = TextEditingController(text: fmt(existing?.temperature));
+  final topPCtl = TextEditingController(text: fmt(existing?.topP));
+  final topKCtl = TextEditingController(text: fmt(existing?.topK));
+  final tokensCtl = TextEditingController(text: fmt(existing?.maxTokens));
+  final freqCtl =
+      TextEditingController(text: fmt(existing?.frequencyPenalty));
+  final presCtl = TextEditingController(text: fmt(existing?.presencePenalty));
+  final minPCtl = TextEditingController(text: fmt(existing?.minP));
+  final topACtl = TextEditingController(text: fmt(existing?.topA));
+  final repCtl =
+      TextEditingController(text: fmt(existing?.repetitionPenalty));
+  // 2026-07-04 (Gui approved): DRY anti-repetition + banned words.
+  final dryMultCtl = TextEditingController(text: fmt(existing?.dryMultiplier));
+  final dryBaseCtl = TextEditingController(text: fmt(existing?.dryBase));
+  final dryLenCtl =
+      TextEditingController(text: fmt(existing?.dryAllowedLength));
+  final bannedCtl =
+      TextEditingController(text: (existing?.bannedWords ?? const []).join(', '));
+
+  // Pyre 1.1 (Prompt Manager): a working DRAFT copy of the preset's modular
+  // prompt blocks. We deep-copy so toggles/edits/reorders are only committed
+  // when the user taps Save (mirrors how the text controllers stay uncommitted
+  // until Save). A preset with an empty list is FLAT — the block UI never
+  // shows and this list stays empty, so the flat editor is unchanged.
+  final blocks = <PromptBlock>[
+    for (final b in (existing?.promptBlocks ?? const <PromptBlock>[]))
+      PromptBlock(
+        id: b.id,
+        name: b.name,
+        content: b.content,
+        enabled: b.enabled,
+        role: b.role,
+        position: b.position,
+        depth: b.depth,
+      ),
+  ];
+  final isModular = blocks.isNotEmpty;
+
+  Widget sectionHeader(String text) => Padding(
+        padding: const EdgeInsets.only(top: 18, bottom: 6),
+        child: Text(
+          text.toUpperCase(),
+          style: TextStyle(
+            color: EmberColors.primary,
+            fontWeight: FontWeight.w700,
+            fontSize: 11,
+            letterSpacing: 1.2,
+          ),
+        ),
+      );
+
+  Widget hint(String text) => Padding(
+        padding: const EdgeInsets.only(top: 2, bottom: 4),
+        child: Text(
+          text,
+          style: TextStyle(color: EmberColors.textMid, fontSize: 12),
+        ),
+      );
+
+  Widget numField(
+    TextEditingController ctl, {
+    required String label,
+    required String hint,
+  }) =>
+      TextField(
+        controller: ctl,
+        keyboardType:
+            const TextInputType.numberWithOptions(decimal: true, signed: true),
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: hint,
+          isDense: true,
+        ),
+      );
+
+  // H-3: dispose every controller this dialog created once it closes. The
+  // dialog body only reads them while open, so disposing after the await is
+  // safe; .whenComplete fires on both Save and dismiss.
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: EmberColors.bgPanel,
+      title: Text(existing == null ? 'New preset' : 'Edit preset'),
+      content: SizedBox(
+        width: 460,
+        child: SingleChildScrollView(
+          // StatefulBuilder gives the block list a local setState so toggling /
+          // reordering / adding / deleting a block rebuilds only this dialog
+          // body. The `blocks` draft + the text controllers live in the
+          // enclosing closure; Save reads both. Flat presets never hit the
+          // block branch, so their editor is byte-for-byte unchanged.
+          child: StatefulBuilder(
+            builder: (ctx, setLocal) => Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              sectionHeader('Identity'),
+              TextField(
+                controller: nameCtl,
+                decoration: const InputDecoration(labelText: 'Name'),
+              ),
+              // MODULAR preset → show the toggleable "Prompt blocks" list in
+              // place of the flat Main/Post text fields. FLAT preset → keep the
+              // existing Main prompt + Post-history fields exactly as before.
+              if (isModular)
+                _PromptBlocksSection(blocks: blocks, setLocal: setLocal)
+              else ...[
+                sectionHeader('Prompts'),
+                hint('Main prompt — sent BEFORE the chat history.'),
+                TextField(
+                  controller: mainCtl,
+                  maxLines: 8,
+                  minLines: 4,
+                  decoration: const InputDecoration(
+                    hintText:
+                        'Supports {{char}}, {{user}}, {{description}}, {{personality}}, {{scenario}}, {{persona}}, {{mesExample}}, {{wiBefore}}.',
+                  ),
+                ),
+                const SizedBox(height: 12),
+                hint(
+                    'Post-history — appended AFTER the chat as a final reminder (jailbreak / prefill).'),
+                TextField(
+                  controller: postCtl,
+                  maxLines: 5,
+                  minLines: 2,
+                  decoration: const InputDecoration(
+                    hintText: 'Optional. Same template tokens as Main.',
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              hint(
+                  'Impersonate prompt — used by the "Impersonate me" action to draft the next user message.'),
+              TextField(
+                controller: impCtl,
+                maxLines: 3,
+                minLines: 2,
+                decoration: const InputDecoration(
+                  hintText:
+                      'Optional. Supports {{user}}, {{char}}. Default: write next message as the persona.',
+                ),
+              ),
+              const SizedBox(height: 12),
+              hint(
+                  'Continue nudge — used by Continue to extend a truncated reply.'),
+              TextField(
+                controller: cntCtl,
+                maxLines: 3,
+                minLines: 2,
+                decoration: const InputDecoration(
+                  hintText:
+                      'Optional. Supports {{char}}, {{lastChatMessage}}.',
+                ),
+              ),
+              const SizedBox(height: 12),
+              hint(
+                  'Start reply with — forces every reply to BEGIN with this '
+                  'text. Great for locking format or cutting refusals '
+                  '(native on Anthropic; most local backends honor it too).'),
+              TextField(
+                controller: startCtl,
+                maxLines: 2,
+                minLines: 1,
+                decoration: const InputDecoration(
+                  hintText: 'Optional. Supports {{char}}, {{user}} — e.g. '
+                      '"{{char}}:"',
+                ),
+              ),
+              sectionHeader('Sampling overrides'),
+              hint(
+                  'Each field overrides your global default (set in Default generation above) only when filled. Leave blank to use the global default.'),
+              Row(children: [
+                Expanded(
+                    child: numField(tempCtl,
+                        label: 'Temperature', hint: '0.0 – 2.0')),
+                const SizedBox(width: 12),
+                Expanded(
+                    child: numField(topPCtl,
+                        label: 'Top-P', hint: '0.0 – 1.0')),
+              ]),
+              const SizedBox(height: 12),
+              Row(children: [
+                Expanded(
+                    child: numField(topKCtl,
+                        label: 'Top-K', hint: 'int, 0 = off')),
+                const SizedBox(width: 12),
+                Expanded(
+                    child: numField(tokensCtl,
+                        label: 'Max tokens', hint: 'int')),
+              ]),
+              const SizedBox(height: 12),
+              Row(children: [
+                Expanded(
+                    child: numField(freqCtl,
+                        label: 'Frequency penalty', hint: '−2.0 – 2.0')),
+                const SizedBox(width: 12),
+                Expanded(
+                    child: numField(presCtl,
+                        label: 'Presence penalty', hint: '−2.0 – 2.0')),
+              ]),
+              const SizedBox(height: 12),
+              Row(children: [
+                Expanded(
+                    child: numField(minPCtl,
+                        label: 'Min-P', hint: '0.0 – 1.0')),
+                const SizedBox(width: 12),
+                Expanded(
+                    child: numField(topACtl,
+                        label: 'Top-A', hint: '0.0 – 1.0')),
+              ]),
+              const SizedBox(height: 12),
+              numField(repCtl,
+                  label: 'Repetition penalty', hint: '1.0 – 1.5 typical'),
+              sectionHeader('Anti-repetition (DRY) & banned words'),
+              hint(
+                  'For local/self-hosted backends (llama.cpp, KoboldCpp, '
+                  'TabbyAPI, vLLM) and some OpenRouter routes — hosted '
+                  'providers that don\'t support these simply ignore them. '
+                  'DRY punishes the model for repeating its own phrasing '
+                  '(the "same sentence every message" fix).'),
+              Row(children: [
+                Expanded(
+                    child: numField(dryMultCtl,
+                        label: 'DRY multiplier', hint: '0.8 typical, 0 = off')),
+                const SizedBox(width: 12),
+                Expanded(
+                    child: numField(dryBaseCtl,
+                        label: 'DRY base', hint: '1.75 typical')),
+              ]),
+              const SizedBox(height: 12),
+              numField(dryLenCtl,
+                  label: 'DRY allowed length', hint: 'int, 2 typical'),
+              const SizedBox(height: 12),
+              hint(
+                  'Banned words — the model is blocked from producing these '
+                  '(unlike Regex, which cleans text after the fact).'),
+              TextField(
+                controller: bannedCtl,
+                maxLines: 3,
+                minLines: 1,
+                decoration: const InputDecoration(
+                  hintText:
+                      'Comma-separated, e.g. ministrations, shivers down her spine',
+                ),
+              ),
+            ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            // Parse helpers — empty string means "no override" (null).
+            double? d(TextEditingController c) {
+              final t = c.text.trim();
+              if (t.isEmpty) return null;
+              return double.tryParse(t);
+            }
+
+            int? i(TextEditingController c) {
+              final t = c.text.trim();
+              if (t.isEmpty) return null;
+              return int.tryParse(t);
+            }
+
+            String? s(TextEditingController c) {
+              final t = c.text.trim();
+              return t.isEmpty ? null : t;
+            }
+
+            List<String> words(TextEditingController c) => c.text
+                .split(RegExp(r'[,\n]'))
+                .map((w) => w.trim())
+                .where((w) => w.isNotEmpty)
+                .toList();
+
+            if (existing == null) {
+              store.addPreset(Preset(
+                id: newId('preset'),
+                name: nameCtl.text.trim().isEmpty
+                    ? 'Preset'
+                    : nameCtl.text.trim(),
+                mainPrompt: mainCtl.text.trim(),
+                postHistoryInstructions: postCtl.text.trim(),
+                impersonationPrompt: s(impCtl),
+                continueNudgePrompt: s(cntCtl),
+                startReplyWith: s(startCtl),
+                temperature: d(tempCtl),
+                topP: d(topPCtl),
+                topK: i(topKCtl),
+                maxTokens: i(tokensCtl),
+                frequencyPenalty: d(freqCtl),
+                presencePenalty: d(presCtl),
+                minP: d(minPCtl),
+                topA: d(topACtl),
+                repetitionPenalty: d(repCtl),
+                dryMultiplier: d(dryMultCtl),
+                dryBase: d(dryBaseCtl),
+                dryAllowedLength: i(dryLenCtl),
+                bannedWords: words(bannedCtl),
+              ));
+            } else {
+              existing
+                ..name = nameCtl.text.trim()
+                ..mainPrompt = mainCtl.text.trim()
+                ..postHistoryInstructions = postCtl.text.trim()
+                ..impersonationPrompt = s(impCtl)
+                ..continueNudgePrompt = s(cntCtl)
+                ..startReplyWith = s(startCtl)
+                ..temperature = d(tempCtl)
+                ..topP = d(topPCtl)
+                ..topK = i(topKCtl)
+                ..maxTokens = i(tokensCtl)
+                ..frequencyPenalty = d(freqCtl)
+                ..presencePenalty = d(presCtl)
+                ..minP = d(minPCtl)
+                ..topA = d(topACtl)
+                ..repetitionPenalty = d(repCtl)
+                ..dryMultiplier = d(dryMultCtl)
+                ..dryBase = d(dryBaseCtl)
+                ..dryAllowedLength = i(dryLenCtl)
+                ..bannedWords = words(bannedCtl);
+              // MODULAR preset → commit the working block draft (toggles /
+              // edits / reorders / adds / deletes). Empty content + name fields
+              // weren't shown for a modular preset (the blocks ARE the prompt),
+              // so `mainCtl`/`postCtl` carry the original values through as the
+              // assembly-ignored import fallback. Flat presets keep `blocks`
+              // empty here, so this assigns the same empty list (no-op).
+              existing.promptBlocks = blocks;
+              store.updatePreset(existing);
+            }
+            Navigator.pop(ctx);
+          },
+          child: Text(existing == null ? 'Create' : 'Save'),
+        ),
+      ],
+    ),
+  );
+  for (final c in <TextEditingController>[
+    nameCtl, mainCtl, postCtl, impCtl, cntCtl, startCtl,
+    tempCtl, topPCtl, topKCtl, tokensCtl, freqCtl,
+    presCtl, minPCtl, topACtl, repCtl,
+    dryMultCtl, dryBaseCtl, dryLenCtl, bannedCtl,
+  ]) {
+    c.dispose();
+  }
+}
+
+/// Pyre 1.1 (Prompt Manager) — the modular block list inside the preset editor.
+///
+/// Renders the editor's `blocks` DRAFT as a reorderable list of rows
+/// (name + "after history" hint chip + on/off Switch), with per-row edit +
+/// delete and an "Add block" button. Mutations are made on the SHARED draft
+/// list passed in by [blocks] and committed only when the user taps the
+/// editor's Save (which assigns `existing.promptBlocks = blocks`). [setLocal]
+/// is the enclosing StatefulBuilder's setState so the list re-renders after a
+/// toggle / reorder / add / delete / edit.
+///
+/// Only built for MODULAR presets — flat presets never reach this widget, so
+/// their editor is unchanged.
+class _PromptBlocksSection extends StatelessWidget {
+  final List<PromptBlock> blocks;
+  final StateSetter setLocal;
+  const _PromptBlocksSection({required this.blocks, required this.setLocal});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: EdgeInsets.only(top: 18, bottom: 6),
+          child: Text(
+            'PROMPT BLOCKS',
+            style: TextStyle(
+              color: EmberColors.primary,
+              fontWeight: FontWeight.w700,
+              fontSize: 11,
+              letterSpacing: 1.2,
+            ),
+          ),
+        ),
+        Padding(
+          padding: EdgeInsets.only(top: 2, bottom: 8),
+          child: Text(
+            'Toggle which modules are active. Drag to reorder; tap a block to '
+            'edit its text. Enabled blocks are assembled in this order.',
+            style: TextStyle(color: EmberColors.textMid, fontSize: 12),
+          ),
+        ),
+        if (blocks.isEmpty)
+          Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Text(
+              'No blocks yet. Add one below.',
+              style: TextStyle(color: EmberColors.textDim, fontSize: 12),
+            ),
+          )
+        else
+          // ReorderableListView inside a SingleChildScrollView needs bounded
+          // height + its own non-scrolling physics, so it lays out its rows
+          // without fighting the outer scroll view for gestures.
+          ReorderableListView.builder(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            buildDefaultDragHandles: false,
+            itemCount: blocks.length,
+            // onReorder's classic (oldIndex,newIndex) contract — we apply the
+            // standard newIndex-- adjustment ourselves (mirrors the pattern in
+            // api_connections_screen.dart). onReorderItem would pre-adjust.
+            // ignore: deprecated_member_use
+            onReorder: (oldIndex, newIndex) {
+              setLocal(() {
+                if (newIndex > oldIndex) newIndex -= 1;
+                final moved = blocks.removeAt(oldIndex);
+                blocks.insert(newIndex, moved);
+              });
+            },
+            itemBuilder: (ctx, index) {
+              final b = blocks[index];
+              return _BlockRow(
+                key: ValueKey(b.id.isEmpty ? 'block-$index' : b.id),
+                block: b,
+                index: index,
+                onToggle: (v) => setLocal(() => b.enabled = v),
+                onEdit: () => _showBlockEditor(context, b, setLocal),
+                onDelete: () => setLocal(() => blocks.removeAt(index)),
+              );
+            },
+          ),
+        const SizedBox(height: 8),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            onPressed: () => setLocal(() {
+              blocks.add(PromptBlock(
+                id: newId('block'),
+                name: 'New block',
+                content: '',
+                enabled: true,
+                role: 'system',
+                position: PromptBlockPosition.beforeHistory,
+              ));
+            }),
+            icon: const Icon(Icons.add, size: 18),
+            label: const Text('Add block'),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// One row in the prompt-block list: drag handle + name + "after history" hint
+/// chip + edit + delete + the on/off Switch. Tapping the body (or the pencil)
+/// opens the block editor.
+class _BlockRow extends StatelessWidget {
+  final PromptBlock block;
+  final int index;
+  final ValueChanged<bool> onToggle;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+  const _BlockRow({
+    super.key,
+    required this.block,
+    required this.index,
+    required this.onToggle,
+    required this.onEdit,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final name = block.name.trim().isEmpty ? '(unnamed block)' : block.name;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: EmberColors.bgElevated,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: EmberColors.stroke, width: 1),
+      ),
+      child: Row(
+        children: [
+          ReorderableDragStartListener(
+            index: index,
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(8, 12, 4, 12),
+              child: Icon(Icons.drag_indicator,
+                  size: 20, color: EmberColors.textDim),
+            ),
+          ),
+          Expanded(
+            child: InkWell(
+              onTap: onEdit,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: block.enabled
+                              ? EmberColors.textHigh
+                              : EmberColors.textDim,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                    ..._blockMetaChips(block),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.edit_outlined, size: 18),
+            color: EmberColors.textMid,
+            tooltip: 'Edit block',
+            visualDensity: VisualDensity.compact,
+            onPressed: onEdit,
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_outline, size: 18),
+            color: EmberColors.danger,
+            tooltip: 'Delete block',
+            visualDensity: VisualDensity.compact,
+            onPressed: onDelete,
+          ),
+          Switch(
+            value: block.enabled,
+            onChanged: onToggle,
+          ),
+          const SizedBox(width: 4),
+        ],
+      ),
+    );
+  }
+}
+
+/// The little metadata chips shown on a block row / preview: a role chip for a
+/// non-system block (`user` / `assistant`) and a placement chip — `@depth N`
+/// for a depth-injected block, else `after history` for an afterHistory block.
+/// A plain system + before-history block shows nothing (the default).
+List<Widget> _blockMetaChips(PromptBlock b) {
+  final r = b.role.toLowerCase();
+  return [
+    if (r == 'user' || r == 'assistant') _MetaChip(r),
+    if (b.depth != null)
+      _MetaChip('@depth ${b.depth}')
+    else if (b.position == PromptBlockPosition.afterHistory)
+      const _MetaChip('after history'),
+  ];
+}
+
+/// Small hint chip on a block row (role / placement). See [_blockMetaChips].
+class _MetaChip extends StatelessWidget {
+  final String label;
+  const _MetaChip(this.label);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(left: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: EmberColors.bgPanel,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: EmberColors.stroke),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: EmberColors.textMid,
+          fontSize: 9,
+          fontWeight: FontWeight.w600,
+          letterSpacing: 0.4,
+        ),
+      ),
+    );
+  }
+}
+
+/// Edit one block's name + content + position. Mutates [block] in place on
+/// Save (it's already part of the editor's working draft) and calls
+/// [setLocal] so the parent list re-renders the updated name / position chip.
+Future<void> _showBlockEditor(
+  BuildContext context,
+  PromptBlock block,
+  StateSetter setLocal,
+) async {
+  final nameCtl = TextEditingController(text: block.name);
+  final contentCtl = TextEditingController(text: block.content);
+  // ROLE: a non-system block becomes a real chat turn (Prompt Manager Core).
+  var role = const {'user', 'assistant'}.contains(block.role.toLowerCase())
+      ? block.role.toLowerCase()
+      : 'system';
+  // PLACEMENT: before / after history, or "at depth" (sets PromptBlock.depth,
+  // which overrides position in assembly).
+  var placement = block.depth != null
+      ? 'depth'
+      : (block.position == PromptBlockPosition.afterHistory
+          ? 'after'
+          : 'before');
+  final depthCtl = TextEditingController(text: (block.depth ?? 4).toString());
+
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: EmberColors.bgPanel,
+      title: const Text('Edit block'),
+      content: SizedBox(
+        width: 460,
+        child: SingleChildScrollView(
+          child: StatefulBuilder(
+            builder: (ctx, setDialog) => Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: nameCtl,
+                  decoration: const InputDecoration(labelText: 'Block name'),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: contentCtl,
+                  maxLines: 10,
+                  minLines: 5,
+                  decoration: const InputDecoration(
+                    labelText: 'Content',
+                    hintText:
+                        'The text this module contributes. Same template '
+                        'tokens as a main prompt.',
+                    alignLabelWithHint: true,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'ROLE',
+                  style: TextStyle(
+                    color: EmberColors.primary,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 11,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(value: 'system', label: Text('System')),
+                    ButtonSegment(value: 'user', label: Text('User')),
+                    ButtonSegment(value: 'assistant', label: Text('Assistant')),
+                  ],
+                  selected: {role},
+                  onSelectionChanged: (s) => setDialog(() => role = s.first),
+                  showSelectedIcon: false,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  role == 'system'
+                      ? 'Joins the system prompt as plain instructions.'
+                      : 'Sent as a real "$role" chat turn (SillyTavern-style).',
+                  style: TextStyle(
+                      color: EmberColors.textDim, fontSize: 11),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'PLACEMENT',
+                  style: TextStyle(
+                    color: EmberColors.primary,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 11,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(
+                        value: 'before', label: Text('Before history')),
+                    ButtonSegment(value: 'after', label: Text('After history')),
+                    ButtonSegment(value: 'depth', label: Text('At depth')),
+                  ],
+                  selected: {placement},
+                  onSelectionChanged: (s) =>
+                      setDialog(() => placement = s.first),
+                  showSelectedIcon: false,
+                ),
+                if (placement == 'depth') ...[
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Text('Depth from end:',
+                          style: TextStyle(
+                              color: EmberColors.textMid, fontSize: 12)),
+                      const SizedBox(width: 10),
+                      SizedBox(
+                        width: 72,
+                        child: TextField(
+                          controller: depthCtl,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            contentPadding: EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 8),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '0 = after the last message · 1 = before the last · higher '
+                    '= further back in the chat.',
+                    style:
+                        TextStyle(color: EmberColors.textDim, fontSize: 11),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            setLocal(() {
+              block.name = nameCtl.text.trim();
+              block.content = contentCtl.text;
+              block.role = role;
+              if (placement == 'depth') {
+                final d = int.tryParse(depthCtl.text.trim()) ?? 4;
+                block.depth = d < 0 ? 0 : d;
+                // Depth overrides position in assembly; keep afterHistory as the
+                // sane "in-chat" default for any reader of position.
+                block.position = PromptBlockPosition.afterHistory;
+              } else {
+                block.depth = null;
+                block.position = placement == 'after'
+                    ? PromptBlockPosition.afterHistory
+                    : PromptBlockPosition.beforeHistory;
+              }
+            });
+            Navigator.pop(ctx);
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    ),
+  );
+  // H-3: dispose the block-editor controllers once the dialog closes.
+  nameCtl.dispose();
+  contentCtl.dispose();
+  depthCtl.dispose();
+}

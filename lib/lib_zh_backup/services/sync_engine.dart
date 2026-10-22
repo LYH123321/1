@@ -1,0 +1,1889 @@
+// Wave CY.18.70: native-mobile sync loop.
+//
+// Lives on Android (and the eventual iOS build). NOT on the desktop
+// server (the desktop IS the source of truth — it has nothing to sync
+// FROM, only TO). NOT on web/PWA (which uses RemoteBackend's direct
+// HTTP calls instead of a sync loop — Wave 71).
+//
+// Loop (one "tick"):
+//   1. Read prefs['sync.lastServerTime'] (millis-since-epoch). 0 on
+//      first ever sync.
+//   2. GET /pull?since=<lastSync>&collections=<all> from LanClient.
+//   3. For each incoming record: apply via LWW (only if local.mtime
+//      < incoming.mtime). Bump AppStore.notifyListeners() when at
+//      least one record landed.
+//   4. If GenerationKeepAlive.isGenerating → skip push, fall through
+//      to step 6.
+//   5. POST /push with locally-modified records (mtime > lastSync).
+//      Rejected records → schedule a fresh pull immediately so we
+//      learn the server's newer value.
+//   6. prefs['sync.lastServerTime'] = response.serverTime.
+//
+// Triggers:
+//   - App resume (WidgetsBindingObserver.didChangeAppLifecycleState).
+//   - Periodic 30s timer while foreground.
+//   - Manual: forceTick() from the "Force sync now" button.
+//
+// Failure handling:
+//   - Any network/HTTP error → log + bump _consecutiveFailures.
+//     After 2 in a row, expose status = `offline` so the app shell's
+//     SyncStatusPill can show "Offline" until the next success.
+//   - 401 from server → disconnect locally (token revoked from
+//     desktop). User has to re-pair.
+//
+// Concurrency:
+//   - Serialised. `_tickInFlight` guards against re-entry; a tick
+//     that's still running when the next timer fires just gets
+//     skipped. This is fine because the next timer will pick up the
+//     slack.
+
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:cryptography/cryptography.dart' show SecretKey;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../models/models.dart';
+import '../state/app_store.dart';
+import 'attachment_refs.dart';
+import 'attachment_store.dart';
+import 'generation_keepalive.dart';
+import 'key_crypto.dart';
+import 'lan_client.dart';
+import 'regex_rules.dart';
+import 'secure_keys.dart';
+import 'sync_conflict.dart';
+import 'sync_manifest.dart';
+
+/// Mega-audit 2026-06-05 (H-4): the app shell registers this so the engine can
+/// surface a conflict WARNING dialog (mode == [SyncConflictMode.ask]) before
+/// applying a pull that diverged on both devices. Returns the user's choice:
+///   * `true`  → take the OTHER device (apply the incoming records),
+///   * `false` → keep THIS device (skip the conflicting incoming records),
+///   * `null`  → dismissed → ABORT the apply entirely (don't silently LWW).
+/// If no callback is registered (e.g. headless/background), the engine treats
+/// `ask` as "keep this device" for safety — it never blocks the sync loop.
+typedef SyncConflictPrompt = Future<bool?> Function(List<SyncConflict> conflicts);
+
+enum SyncStatus {
+  /// Either never run or last tick was clean and idle is the steady
+  /// state until the next trigger.
+  idle,
+
+  /// A tick is in flight (pull or push).
+  syncing,
+
+  /// Last tick succeeded recently. UI may flash a tiny success blip
+  /// then fall back to idle.
+  success,
+
+  /// Last tick failed but we haven't crossed the "offline" threshold
+  /// yet (1 failure).
+  warning,
+
+  /// Two or more consecutive failures — surface "Offline" in the
+  /// status pill.
+  offline,
+
+  /// Disconnected (LanClient.isPaired is false). Default for native
+  /// builds where the user hasn't paired yet.
+  disconnected,
+}
+
+/// SYNC W1: should the per-server sync watermark reset to 0?
+///
+/// The watermark (`sync.lastServerTime`) is a cursor into ONE server's history.
+/// It's meaningless against a different server — a re-pair, or a factory-reset
+/// PC that re-minted our `deviceId`. Returns true when [currentDeviceId] differs
+/// from the [storedDeviceId] the watermark was last built against (including the
+/// first-ever pair where stored is null — harmless, the watermark is already 0).
+/// A null [currentDeviceId] (not paired / unknown) leaves the watermark
+/// untouched. Resetting forces the next tick to do a FULL push/pull, fixing the
+/// "only some cards/chats/presets came over after re-pairing" bug.
+bool syncWatermarkMustReset(String? currentDeviceId, String? storedDeviceId) {
+  if (currentDeviceId == null) return false;
+  return currentDeviceId != storedDeviceId;
+}
+
+/// 2026-06-15 push-clock-domain fix: advance/hold the CLIENT-domain push cursor.
+///
+/// Root cause it fixes: the push side used to filter local records by
+/// `mtime > _lastServerTime`, but `_lastServerTime` is the SERVER's wall clock
+/// (handed back by /pull) while a locally-created record's `mtime` is THIS
+/// device's wall clock. When the server clock runs AHEAD of the client clock, a
+/// freshly-created local record has `mtime < _lastServerTime` from birth, so
+/// `_collectDirty` never picks it up — and every pull pushes the watermark even
+/// higher, so it stays below forever. (Pull is immune: server-domain `since` vs
+/// server-domain remote mtimes — which is why desktop→phone always worked but
+/// phone→desktop silently dropped new records.) The fix keeps a SEPARATE push
+/// cursor in the client's own clock domain so a local mtime is only ever
+/// compared against a same-clock value.
+///
+/// [nextPushCursor] computes the cursor's value at the end of a tick:
+///   - HOLD the [current] cursor when the push did NOT run ([pushRan] false —
+///     generation in-flight / conflict abort), OR a [hardReject] occurred, OR
+///     the conflict dialog was dismissed ([conflictAbort]) — so the un-pushed /
+///     rejected local records stay `mtime > cursor` and re-collect next tick
+///     (no lost update);
+///   - otherwise advance to [pushBoundary], but NEVER backwards (a briefly-
+///     backwards clock must not re-open already-pushed records for an echo
+///     storm).
+///
+/// Sync-B (2026-07-17, Codex, stage 2): [pushBoundary] is the LOGICAL cursor
+/// `store.lastIssuedLocalMtime` captured BEFORE the collection snapshot — NOT a
+/// wall clock. Local records are stamped through `nextSyncMtime()`, so every
+/// collected record has `mtime <= pushBoundary`; advancing the cursor to it
+/// marks exactly the shipped records clean. The old wall-clock `pushClock` was
+/// wrong under a backward clock: a monotonic mtime (e.g. 5001, minted above the
+/// rolled-back wall time) sat ABOVE `pushClock` (5000), so the cursor never
+/// covered it and the record re-collected on every tick forever ("dirty
+/// forever"). Anything written after the capture gets `mtime > pushBoundary`
+/// and is caught next tick — same stamp-before-select discipline as before.
+int nextPushCursor({
+  required int current,
+  required int pushBoundary,
+  required bool pushRan,
+  required bool hardReject,
+  required bool conflictAbort,
+}) {
+  if (!pushRan || hardReject || conflictAbort) return current;
+  return pushBoundary > current ? pushBoundary : current;
+}
+
+/// Sync-B stage 3 (2026-07-17, Codex): decide whether a v2 /push `results`
+/// array forces the push cursor to HOLD (re-collect + re-push next tick).
+///
+/// We ADVANCE only on a KNOWN terminal outcome (accepted / superseded /
+/// tombstoned / invalid_record / immutable_record / policy_rejected) — those
+/// can't change on a retry. Everything else HOLDS the cursor (retry):
+///   * `unsupported_collection` — the hub is older and lacks this record type;
+///     retry until it upgrades (loss-safe; a same-build user never hits this).
+///   * `retryable_error` — a transient hub-side apply failure (keystore I/O).
+///   * an UNKNOWN code — blocker 4 (Codex review): advancing over a code we
+///     don't understand is not loss-safe, so we HOLD. (Forward-compat is
+///     handled by adding new benign codes to the known-terminal set on the
+///     client BEFORE a hub emits them.)
+///   * a non-Map entry or a missing/blank `code` — we can't confirm the item
+///     landed, so we retry rather than advance over a possible loss.
+const Set<String> _syncTerminalOutcomes = {
+  'accepted',
+  'superseded',
+  'tombstoned',
+  'invalid_record',
+  'immutable_record',
+  'policy_rejected',
+};
+
+bool syncPushHoldForResults(List<dynamic> results) {
+  return results.any((r) {
+    if (r is! Map) return true; // garbled entry → retry
+    final code = r['code']?.toString();
+    if (code == null || code.isEmpty) return true; // no outcome → retry
+    return !_syncTerminalOutcomes.contains(code); // unknown/hold → retry
+  });
+}
+
+class SyncEngine extends ChangeNotifier with WidgetsBindingObserver {
+  SyncEngine._();
+  static final SyncEngine instance = SyncEngine._();
+
+  static const String _prefLastServerTime = 'sync.lastServerTime';
+
+  /// 2026-06-15 push-clock-domain fix: the CLIENT-clock push cursor — distinct
+  /// from `_prefLastServerTime`, which stores the SERVER clock. Push collection
+  /// filters by this so a local mtime is only compared against a same-clock
+  /// value (see [nextPushCursor]).
+  static const String _prefLastPushTime = 'sync.lastPushTime';
+
+  /// SYNC W1: the server `deviceId` the watermark above was last built against,
+  /// so we can detect a re-pair / factory-reset server and reset the cursor.
+  static const String _prefSyncedServerDeviceId = 'sync.serverDeviceId';
+  static const Duration _pollInterval = Duration(seconds: 30);
+  static const Duration _httpTimeout = Duration(seconds: 12);
+
+  AppStore? _store;
+  Timer? _poll;
+  bool _tickInFlight = false;
+  int _consecutiveFailures = 0;
+  int _lastServerTime = 0;
+
+  /// 2026-06-15 push-clock-domain fix: push cursor in THIS device's own clock
+  /// domain. The push side (`_collectDirty` / providers / tombstones) filters by
+  /// this, NEVER `_lastServerTime` (the server clock), so a local record's mtime
+  /// is only ever compared against a same-clock value. See [nextPushCursor].
+  int _lastPushTime = 0;
+  DateTime? _lastSuccessAt;
+  String? _lastError;
+  SyncStatus _status = SyncStatus.disconnected;
+  bool _serverIsNewer = false;
+
+  // SYNC W5 (transparency UI): cheap per-tick metrics so the SyncStatusPill +
+  // LAN screen can show WHAT the last successful tick moved, not just that it
+  // happened. Both reset to 0 only when a tick actually starts applying its
+  // results — a failed tick leaves the previous successful counts visible so
+  // the UI doesn't flash "0 pulled / 0 pushed" mid-retry. `_lastPulledCount`
+  // = records applied from the pull (the existing `appliedAny` accounting,
+  // now counted), `_lastPushedCount` = records the server `accepted` in the
+  // push response. Updated at the END of a successful tick; notifyListeners
+  // already fires on the status flip to `success`, so the UI repaints for free.
+  int _lastPulledCount = 0;
+  int _lastPushedCount = 0;
+
+  /// Mega-audit 2026-06-05 (H-4): UI hook for the conflict warning dialog.
+  /// Registered by the app shell after the first frame; null in headless /
+  /// test contexts (in which case `ask` mode falls back to "keep this device").
+  SyncConflictPrompt? conflictPrompt;
+
+  /// Wave CY.18.72: true when the most recent /pull response carried
+  /// a `serverAppVersion` greater than what this build knows about.
+  /// UI bindings (the LAN connect screen, eventually a top-of-app
+  /// banner) read this to nudge the user to upgrade. Records with
+  /// unknown fields still apply — they just round-trip the extra
+  /// fields blindly through fromJson/toJson, which is safe because
+  /// every fromJson here is additive-tolerant.
+  bool get serverIsNewer => _serverIsNewer;
+
+  /// Wire-shape version the client understands. Bumped in lockstep
+  /// with PyreServer's `_serverAppVersion`. If a future server adds
+  /// a new collection or changes the /pull response shape, bump
+  /// this too so the mismatch banner fires at the right moment.
+  static const int _clientAppVersion = 1;
+
+  SyncStatus get status => _status;
+  DateTime? get lastSuccessAt => _lastSuccessAt;
+  String? get lastError => _lastError;
+
+  /// SYNC W5 (transparency UI): records APPLIED from the most recent successful
+  /// pull (incoming records that actually changed local state). Read-only — the
+  /// UI surfaces it as "Pulled N". Starts at 0; survives a failed retry so the
+  /// last good numbers stay on screen.
+  int get lastPulledCount => _lastPulledCount;
+
+  /// SYNC W5 (transparency UI): records the server ACCEPTED in the most recent
+  /// successful push. Read-only — surfaced as "Pushed N". 0 when the last tick
+  /// had nothing dirty to send.
+  int get lastPushedCount => _lastPushedCount;
+
+  /// Install at app boot. Caller (main.dart) passes the AppStore. Safe
+  /// to call repeatedly (re-install is a no-op).
+  void install(AppStore store) {
+    if (_store != null) return;
+    _store = store;
+    WidgetsBinding.instance.addObserver(this);
+    LanClient.instance.addListener(_onLanClientChange);
+    _refreshStatusFromPairing();
+    _ensurePoll();
+    // Fire a first tick a beat after boot so the splash transition
+    // doesn't compete with HTTP.
+    Future.delayed(const Duration(seconds: 3), () {
+      if (LanClient.instance.isPaired) unawaited(_tick());
+    });
+  }
+
+  /// Batch E (audit) test seam: point the singleton at a store WITHOUT the
+  /// app-lifecycle wiring `install()` performs (WidgetsBinding observer,
+  /// LanClient listener, periodic poll Timer, delayed auto-tick) — none of
+  /// that is part of the merge/tombstone logic under test, and a real
+  /// `Timer.periodic` would outlive a unit test. Lets `test/sync_engine_
+  /// merge_test.dart` drive the REAL `_tick()` (via [forceTick]) against a
+  /// faked HTTP peer instead of re-implementing `_keepLocalMtime` / the
+  /// tombstone reap boundary locally. Also resets the per-tick cursors and
+  /// counters so each test starts clean regardless of prior singleton state.
+  @visibleForTesting
+  void debugInstallForTest(AppStore store) {
+    _store = store;
+    _lastServerTime = 0;
+    _lastPushTime = 0;
+    _tickInFlight = false;
+    _consecutiveFailures = 0;
+    _lastError = null;
+    _status = SyncStatus.idle;
+  }
+
+  /// Manual force-tick from the "Force sync now" button.
+  Future<void> forceTick() async {
+    if (!LanClient.instance.isPaired) return;
+    await _tick();
+  }
+
+  /// Wave CY.18.266: force a one-shot FULL re-pull by resetting the sync
+  /// watermark to 0, then ticking once.
+  ///
+  /// Needed when the user NEWLY enables provider-key sync on this device.
+  /// Providers are stamped with an mtime at desktop launch; if this device's
+  /// cursor has already advanced past that mtime (because it kept syncing
+  /// other collections), the normal `mtime > since` diff would never ship the
+  /// providers — turning the toggle on would appear to do nothing. Re-pulling
+  /// from `since = 0` is LWW-safe: the apply path only takes records strictly
+  /// newer than the local copy, so nothing already-present is clobbered;
+  /// records new to this device (the providers) get added.
+  ///
+  /// We must zero the PERSISTED watermark too, because `_tick` lazily reloads
+  /// `_lastServerTime` from prefs whenever it's 0 at the top of a tick.
+  Future<void> fullResync() async {
+    // BUGFIX (de-risk 2026-06-13, HIGH): if a periodic/resume tick is already in
+    // flight, its terminal `_lastServerTime = serverTime` write (the in-flight
+    // tick pulled with the OLD `since`, so it never fetched the providers) would
+    // clobber the watermark we're about to zero — defeating the since=0 re-pull,
+    // so newly-enabled provider-key sync silently fetches nothing. Wait that
+    // pre-existing tick out FIRST (bounded ~10s), THEN zero + tick: any tick
+    // that starts AFTER we've zeroed reads 0 and correctly re-pulls from scratch.
+    for (var i = 0; i < 200 && _tickInFlight; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    _lastServerTime = 0;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_prefLastServerTime, 0);
+    } catch (_) {}
+    await forceTick();
+  }
+
+  /// SYNC W6 (verification): read-only "do this device + the PC actually hold
+  /// the same library?" check. Fetches the server's `/manifest`, builds THIS
+  /// device's manifest the same way (buildSyncManifest), and diffs them.
+  ///
+  /// Returns:
+  ///   * a [SyncManifestDiff] on success — the UI reads `allInSync` for the
+  ///     headline and `differing` for the per-collection list;
+  ///   * null when not paired, on any HTTP/network error, or a malformed body
+  ///     — the caller shows a "couldn't check" snackbar.
+  ///
+  /// NEVER mutates data: it only GETs the manifest and compares fingerprints.
+  /// It also does NOT touch the sync watermark, status, or counters — running a
+  /// check is side-effect-free and independent of the normal tick.
+  Future<SyncManifestDiff?> checkSync() async {
+    final store = _store;
+    final client = LanClient.instance;
+    if (store == null || !client.isPaired) return null;
+    final baseUrl = client.baseUrl;
+    if (baseUrl == null) return null;
+    try {
+      final resp = await http
+          .get(Uri.parse('$baseUrl/manifest'), headers: _authHeaders())
+          .timeout(_httpTimeout);
+      if (resp.statusCode != 200) {
+        debugPrint('[SyncEngine] checkSync HTTP ${resp.statusCode}');
+        return null;
+      }
+      final body = jsonDecode(resp.body);
+      if (body is! Map) return null;
+      final remote = parseRemoteManifest(body.cast<String, dynamic>());
+      final local = buildSyncManifest(store);
+      return diffManifests(local, remote);
+    } catch (e) {
+      debugPrint('[SyncEngine] checkSync failed: $e');
+      return null;
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // Resume = the user is back. Pull immediately so they see the
+      // freshest state without waiting up to 30s for the next tick.
+      if (LanClient.instance.isPaired) unawaited(_tick());
+      _ensurePoll();
+    } else if (state == AppLifecycleState.paused) {
+      // Cancel the polling timer while backgrounded — saves battery
+      // + avoids piling up failed ticks when the OS suspends the
+      // network stack.
+      _poll?.cancel();
+      _poll = null;
+    }
+  }
+
+  void _onLanClientChange() {
+    _refreshStatusFromPairing();
+    if (LanClient.instance.isPaired) {
+      _ensurePoll();
+      // Pair-just-happened — kick a tick right away so the new client
+      // gets the full server state in one shot.
+      unawaited(_tick());
+    } else {
+      _poll?.cancel();
+      _poll = null;
+    }
+  }
+
+  void _refreshStatusFromPairing() {
+    if (!LanClient.instance.isPaired) {
+      _setStatus(SyncStatus.disconnected);
+    } else if (_status == SyncStatus.disconnected) {
+      _setStatus(SyncStatus.idle);
+    }
+  }
+
+  void _ensurePoll() {
+    if (_poll != null) return;
+    if (!LanClient.instance.isPaired) return;
+    _poll = Timer.periodic(_pollInterval, (_) {
+      if (LanClient.instance.isPaired) unawaited(_tick());
+    });
+  }
+
+  void _setStatus(SyncStatus s) {
+    if (_status == s) return;
+    _status = s;
+    notifyListeners();
+  }
+
+  Future<void> _tick() async {
+    final store = _store;
+    final client = LanClient.instance;
+    if (store == null || !client.isPaired) return;
+    if (_tickInFlight) return;
+    _tickInFlight = true;
+    _setStatus(SyncStatus.syncing);
+
+    try {
+      // SYNC W1: the watermark is a per-server cursor. If we're now paired to a
+      // DIFFERENT server identity than it was built against (a re-pair, or a
+      // factory-reset PC that re-minted our deviceId), reset it to 0 so THIS
+      // tick does a FULL push/pull — otherwise we'd only sync records newer
+      // than the stale cursor (the "only some cards/chats/presets came over"
+      // bug). The else-branch lazily loads the persisted watermark on the
+      // first tick of the process, exactly as before.
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final storedServerId = prefs.getString(_prefSyncedServerDeviceId);
+        final currentServerId = client.deviceId;
+        if (syncWatermarkMustReset(currentServerId, storedServerId)) {
+          _lastServerTime = 0;
+          // 2026-06-15 push-clock-domain fix: the push cursor is ALSO a
+          // per-server cursor — reset it on a re-pair so THIS tick re-pushes
+          // our whole library to the (new) server.
+          _lastPushTime = 0;
+          await prefs.setInt(_prefLastServerTime, 0);
+          await prefs.setInt(_prefLastPushTime, 0);
+          await prefs.setString(_prefSyncedServerDeviceId, currentServerId!);
+        } else {
+          // Lazy-load both persisted cursors on the first tick of the process.
+          // They are INDEPENDENT — the server watermark is SERVER-clock, the
+          // push cursor is CLIENT-clock — and must never be conflated.
+          if (_lastServerTime == 0) {
+            _lastServerTime = prefs.getInt(_prefLastServerTime) ?? 0;
+          }
+          if (_lastPushTime == 0) {
+            _lastPushTime = prefs.getInt(_prefLastPushTime) ?? 0;
+          }
+        }
+      } catch (_) {}
+
+      // Tier-1 H-1 (2026-07-02): hand the (just loaded-or-reset) push cursor to
+      // the store so its tombstone GC gates on "has this been pushed" even
+      // before this tick's own push completes — covers the fresh-pair edge
+      // where the persisted blob hasn't recorded a watermark yet. Idempotent:
+      // the setter no-ops when the value is unchanged.
+      store.setSyncedPushWatermark(_lastPushTime);
+
+      // ---- 1. PULL ----
+      final pullUri = Uri.parse(
+          '${client.baseUrl}/pull?since=$_lastServerTime');
+      final pullResp = await http
+          .get(pullUri, headers: _authHeaders())
+          .timeout(_httpTimeout);
+      if (pullResp.statusCode == 401) {
+        // Server revoked us. Drop local pairing and surface that.
+        await client.disconnect();
+        throw _SyncError('Server revoked this device. Re-pair to continue.');
+      }
+      if (pullResp.statusCode != 200) {
+        throw _SyncError(
+            'Pull HTTP ${pullResp.statusCode}: ${pullResp.body}');
+      }
+      final pulled =
+          jsonDecode(pullResp.body) as Map<String, dynamic>;
+      final serverTime =
+          (pulled['serverTime'] as num?)?.toInt() ?? _lastServerTime;
+      // Sync-B (2026-07-17, Codex, stage 1): raise the LOCAL monotonic counter
+      // to the hub's advertised high-water. Every pulled record has
+      // `mtime <= serverTime`, so this one call guarantees the next locally
+      // minted mtime (via nextSyncMtime) is strictly greater than anything we
+      // just adopted — otherwise a later edit of a freshly pulled record could
+      // mint an mtime BELOW its current value and demote it below what peers
+      // already hold.
+      store.observeSyncMtime(serverTime);
+      // Keep-local bumps below stamp `serverTime + 1` directly on the record
+      // (bypassing nextSyncMtime); observe each so the counter tracks them too.
+      int keptLocalBump(int st) {
+        final v = _keepLocalMtime(st);
+        store.observeSyncMtime(v);
+        return v;
+      }
+      // Wave CY.18.72: schema-mismatch flag. Server bumps
+      // serverAppVersion when the wire shape changes; if we're
+      // older, surface that to the UI so the user knows to update.
+      // We still apply whatever records we got — fromJson is
+      // additive-tolerant — so the app keeps working in the
+      // meantime.
+      final serverAppVersion =
+          (pulled['serverAppVersion'] as num?)?.toInt() ?? 0;
+      final newServerIsNewer = serverAppVersion > _clientAppVersion;
+      if (newServerIsNewer != _serverIsNewer) {
+        _serverIsNewer = newServerIsNewer;
+        notifyListeners();
+      }
+      final updates =
+          (pulled['updates'] as Map?)?.cast<String, dynamic>() ?? {};
+      // Sync-B (Codex review r6): did this pull RETURN any records/tombstones
+      // (regardless of whether they changed local state)? Used to force a
+      // durable save before the watermark advances — a retry after a failed
+      // persist re-pulls the same records as `superseded`, so `appliedAny` alone
+      // would skip the flush and lose the RAM-only data on a kill.
+      final pullReturnedData =
+          updates.values.any((v) => v is List && v.isNotEmpty) ||
+              ((pulled['tombstones'] as Map?)?.isNotEmpty ?? false);
+
+      var appliedAny = false;
+      // SYNC W5 (transparency UI): count records that actually changed local
+      // state this pull (incremented in lockstep with every `appliedAny = true`
+      // below — same accounting, now totalled). Surfaced as "Pulled N".
+      var appliedCount = 0;
+
+      // ---- Mega-audit 2026-06-05 (H-4): conflict resolution ----
+      // DEFAULT (newestWins) leaves this empty and behavior is byte-for-byte
+      // unchanged from before. For the other modes we detect records that
+      // diverged on BOTH sides since the last sync (`_lastServerTime`), then
+      // either force a winner per-id or (mode==ask) warn the user first.
+      //
+      //   `_conflictForce['<kind>:<id>']` present ⇒ override LWW for that id:
+      //     true  → apply the incoming (peer) record,
+      //     false → keep the local record (skip the incoming).
+      //   Absent ⇒ the apply functions fall back to normal mtime LWW.
+      final conflictForce = <String, bool>{};
+      // When the user DISMISSES the ask-dialog we abort the whole apply this
+      // tick and hold the watermark so nothing is silently LWW'd or lost.
+      var conflictAbort = false;
+      final mode = store.uiPrefs.syncConflictMode;
+      if (mode != SyncConflictMode.newestWins) {
+        final conflicts =
+            _detectConflictsForPull(store, updates, _lastServerTime);
+        if (conflicts.isNotEmpty) {
+          if (mode == SyncConflictMode.ask) {
+            final prompt = conflictPrompt;
+            // No UI hook (headless/test): fall back to keep-this-device rather
+            // than block the loop — never silently take the peer's copy.
+            final choice =
+                prompt == null ? false : await prompt(conflicts);
+            if (choice == null) {
+              conflictAbort = true; // dismissed → abort + hold watermark
+            } else {
+              for (final c in conflicts) {
+                conflictForce['${c.kind}:${c.id}'] = choice;
+              }
+            }
+          } else {
+            // preferThisDevice / preferOtherDevice — global per-mode winner.
+            for (final c in conflicts) {
+              conflictForce['${c.kind}:${c.id}'] =
+                  resolveConflictDecision(c, mode);
+            }
+          }
+        }
+      }
+
+      // Wave CY.18.254: every `pyre://attachment/<hash>` ref carried by a
+      // record we just applied (character/persona avatar + gallery). After
+      // the merge we reconcile these — the refs sync, but the underlying
+      // blob bytes do NOT, so a freshly-synced avatar/gallery renders broken
+      // until we fetch the bytes from the server's GET /attachments/<hash>.
+      final touchedRefs = <String>{};
+
+      // Mega-audit 2026-06-05 (H-4): per-record conflict override lookup.
+      // Returns null when this id is NOT a forced conflict (→ caller does
+      // normal LWW), true to FORCE-apply the incoming, false to KEEP local.
+      bool? forcedDecision(String kind, String id) =>
+          conflictForce['$kind:$id'];
+
+      // SYNC (recrop): the pull-side reconcile now includes the preserved
+      // UNCROPPED `avatarOriginal` (non-destructive recrop) on top of the
+      // displayed avatar + gallery — delegated to the shared pure helper so the
+      // coverage can't drift from the push side / GC. Without the original, a
+      // recropped card synced TO this device renders its full image (shown on
+      // avatar-tap, and used as the chat backdrop) as a broken placeholder
+      // because only the crop's bytes were ever fetched.
+      void noteRefs(
+          String? avatar, String? avatarOriginal, List<String> gallery) {
+        touchedRefs.addAll(incomingRecordAttachmentRefs(
+          avatar: avatar,
+          avatarOriginal: avatarOriginal,
+          gallery: gallery,
+        ));
+      }
+
+      // SYNC W3: apply the incoming settings UNIT (single-element list — it's a
+      // singleton record). `applySyncedSettings` enforces LWW internally (no-op
+      // when not strictly newer) and preserves THIS device's local chat
+      // background. Deliberately EXCLUDED from conflict detection (like
+      // providers) — settings just LWW silently, never popping the conflict
+      // dialog.
+      void applySettings() {
+        final list = (updates['settings'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final before = store.settingsMtime;
+          store.applySyncedSettings(raw.cast<String, dynamic>());
+          if (store.settingsMtime != before) {
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          }
+        }
+      }
+
+      // The BotBooru PROFILE unit (single-element singleton list). LWW is
+      // enforced inside `applySyncedBotbooruProfile` (no-op when not strictly
+      // newer). Like `settings`/`providers` it's EXCLUDED from conflict
+      // detection — it just LWWs silently. After a win we note the profile's
+      // avatar blobs (avatar + uncropped original) so a synced/recropped profile
+      // picture isn't a broken placeholder on pull (only the crop's bytes get
+      // fetched otherwise — same reconcile the per-card paths do via noteRefs).
+      void applyBotbooruProfile() {
+        final list = (updates['botbooruProfile'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final before = store.botbooruProfileMtime;
+          store.applySyncedBotbooruProfile(raw.cast<String, dynamic>());
+          if (store.botbooruProfileMtime != before) {
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+            noteRefs(store.botbooruAvatar, store.botbooruAvatarOriginal,
+                const []);
+          }
+        }
+      }
+
+      void applyChars() {
+        final list = (updates['characters'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          // Per-record isolation: a single record whose fromJson throws
+          // must not abort the whole tick (which would re-throw every
+          // retry and permanently wedge sync). Skip the poison record,
+          // log it, and keep applying the rest.
+          try {
+            final incoming = Character.fromJson(m);
+            // Wave CY.18.256: a local tombstone at/after the incoming
+            // version means we deleted this card — don't resurrect the
+            // peer's stale live copy. Handles pull-before-push ordering:
+            // even if the server still holds the live record, our newer
+            // delete wins.
+            if (store.isTombstonedNewer('character', id, incoming.mtime)) {
+              continue;
+            }
+            final idx = store.characters.indexWhere((c) => c.id == id);
+            final force = forcedDecision('character', id);
+            if (idx >= 0) {
+              if (force == false) {
+                // S-BUG1: bump the local mtime so this record is pushed next
+                // tick and out-dates the peer's copy. Without this, the kept
+                // local copy is never re-pushed (mtime < watermark) and the
+                // peer's version LWW-overwrites it on the next pull.
+                store.characters[idx].mtime = keptLocalBump(serverTime);
+                appliedAny = true; // mtime changed → persist the bump
+                continue;
+              }
+              if (force != true &&
+                  store.characters[idx].mtime >= incoming.mtime) {
+                continue;
+              }
+              store.characters[idx] = incoming;
+            } else {
+              store.characters.add(incoming);
+            }
+            noteRefs(incoming.avatar, incoming.avatarOriginal, incoming.gallery);
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            debugPrint('[SyncEngine] skip bad character "$id": $e');
+          }
+        }
+      }
+
+      void applyPersonas() {
+        final list = (updates['personas'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          try {
+            final incoming = Persona.fromJson(m);
+            // Wave CY.18.256: skip if we deleted this persona at/after the
+            // incoming version (see applyChars for rationale).
+            if (store.isTombstonedNewer('persona', id, incoming.mtime)) {
+              continue;
+            }
+            final idx = store.personas.indexWhere((p) => p.id == id);
+            final force = forcedDecision('persona', id);
+            if (idx >= 0) {
+              if (force == false) {
+                // S-BUG1: bump mtime so the kept-local copy is pushed next tick.
+                store.personas[idx].mtime = keptLocalBump(serverTime);
+                appliedAny = true;
+                continue;
+              }
+              if (force != true &&
+                  store.personas[idx].mtime >= incoming.mtime) {
+                continue;
+              }
+              store.personas[idx] = incoming;
+            } else {
+              store.personas.add(incoming);
+            }
+            noteRefs(incoming.avatar, incoming.avatarOriginal, incoming.gallery);
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            debugPrint('[SyncEngine] skip bad persona "$id": $e');
+          }
+        }
+      }
+
+      void applyChats() {
+        final list = (updates['chats'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          try {
+            final incoming = Chat.fromJson(m);
+            // Wave CY.18.256: skip if we deleted this chat at/after the
+            // incoming version (see applyChars for rationale).
+            if (store.isTombstonedNewer('chat', id, incoming.mtime)) {
+              continue;
+            }
+            final idx = store.chats.indexWhere((c) => c.id == id);
+            final force = forcedDecision('chat', id);
+            if (idx >= 0) {
+              // NOTE (H-4): record-level resolution for a Chat still replaces
+              // the WHOLE chat (entire message array) — per-message merge is a
+              // deeper future enhancement. The win here is the resolution is
+              // user-chosen + warned, not silent.
+              if (force == false) {
+                // S-BUG1: bump mtime so the kept-local copy is pushed next tick.
+                store.chats[idx].mtime = keptLocalBump(serverTime);
+                appliedAny = true;
+                continue;
+              }
+              if (force != true &&
+                  store.chats[idx].mtime >= incoming.mtime) {
+                continue;
+              }
+              store.chats[idx] = incoming;
+            } else {
+              store.chats.add(incoming);
+            }
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            debugPrint('[SyncEngine] skip bad chat "$id": $e');
+          }
+        }
+      }
+
+      void applyPresets() {
+        final list = (updates['presets'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          try {
+            final incoming = Preset.fromJson(m);
+            // Wave CY.18.256: skip if we deleted this preset at/after the
+            // incoming version (see applyChars for rationale).
+            if (store.isTombstonedNewer('preset', id, incoming.mtime)) {
+              continue;
+            }
+            final idx = store.presets.indexWhere((p) => p.id == id);
+            final force = forcedDecision('preset', id);
+            if (idx >= 0) {
+              // Never overwrite locked default — refreshed-from-build.
+              if (store.presets[idx].locked) continue;
+              if (force == false) {
+                // S-BUG1: bump mtime so the kept-local copy is pushed next tick.
+                store.presets[idx].mtime = keptLocalBump(serverTime);
+                appliedAny = true;
+                continue;
+              }
+              if (force != true &&
+                  store.presets[idx].mtime >= incoming.mtime) {
+                continue;
+              }
+              store.presets[idx] = incoming;
+            } else {
+              store.presets.add(incoming);
+            }
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            debugPrint('[SyncEngine] skip bad preset "$id": $e');
+          }
+        }
+      }
+
+      void applyLorebooks() {
+        final list = (updates['lorebooks'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          try {
+            final incoming = Lorebook.fromJson(m);
+            // Wave CY.18.256: skip if we deleted this lorebook at/after the
+            // incoming version (see applyChars for rationale).
+            if (store.isTombstonedNewer('lorebook', id, incoming.mtime)) {
+              continue;
+            }
+            final idx = store.lorebooks.indexWhere((l) => l.id == id);
+            final force = forcedDecision('lorebook', id);
+            if (idx >= 0) {
+              if (force == false) {
+                // S-BUG1: bump mtime so the kept-local copy is pushed next tick.
+                store.lorebooks[idx].mtime = keptLocalBump(serverTime);
+                appliedAny = true;
+                continue;
+              }
+              if (force != true &&
+                  store.lorebooks[idx].mtime >= incoming.mtime) {
+                continue;
+              }
+              store.lorebooks[idx] = incoming;
+            } else {
+              store.lorebooks.add(incoming);
+            }
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            debugPrint('[SyncEngine] skip bad lorebook "$id": $e');
+          }
+        }
+      }
+
+      // Pyre 1.1 (F4): apply incoming REGEX RULE records (LWW by mtime).
+      void applyRegex() {
+        final list = (updates['regexRules'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          try {
+            final incoming = RegexRule.fromJson(m);
+            if (store.isTombstonedNewer('regexRule', id, incoming.mtime)) {
+              continue;
+            }
+            final idx = store.regexRules.indexWhere((r) => r.id == id);
+            final force = forcedDecision('regexRule', id);
+            if (idx >= 0) {
+              if (force == false) {
+                // S-BUG1: bump mtime so the kept-local copy is pushed next tick.
+                store.regexRules[idx].mtime = keptLocalBump(serverTime);
+                appliedAny = true;
+                continue;
+              }
+              if (force != true &&
+                  store.regexRules[idx].mtime >= incoming.mtime) {
+                continue;
+              }
+              store.regexRules[idx] = incoming;
+            } else {
+              store.regexRules.add(incoming);
+            }
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            debugPrint('[SyncEngine] skip bad regexRule "$id": $e');
+          }
+        }
+      }
+
+      // Mega-audit 2026-06-05 (F2): apply incoming FOLDER records (LWW by
+      // mtime, mirrors applyLorebooks).
+      void applyFolders() {
+        final list = (updates['folders'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          try {
+            final incoming = Folder.fromJson(m);
+            if (store.isTombstonedNewer('folder', id, incoming.mtime)) {
+              continue;
+            }
+            final idx = store.folders.indexWhere((f) => f.id == id);
+            final force = forcedDecision('folder', id);
+            if (idx >= 0) {
+              if (force == false) {
+                // S-BUG1: bump mtime so the kept-local copy is pushed next tick.
+                store.folders[idx].mtime = keptLocalBump(serverTime);
+                appliedAny = true;
+                continue;
+              }
+              if (force != true &&
+                  store.folders[idx].mtime >= incoming.mtime) {
+                continue;
+              }
+              store.folders[idx] = incoming;
+            } else {
+              store.folders.add(incoming);
+            }
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            debugPrint('[SyncEngine] skip bad folder "$id": $e');
+          }
+        }
+      }
+
+      // Mega-audit 2026-06-05 (F2): apply incoming CREATOR-PRESET records.
+      // The locked default is excluded from sync (rebuilt-from-build on every
+      // load); never overwrite or duplicate it.
+      void applyCreatorPresets() {
+        final list = (updates['creatorPresets'] as List?) ?? const [];
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          try {
+            final incoming = CreatorPreset.fromJson(m);
+            if (store.isTombstonedNewer('creatorPreset', id, incoming.mtime)) {
+              continue;
+            }
+            final idx = store.creatorPresets.indexWhere((p) => p.id == id);
+            final force = forcedDecision('creatorPreset', id);
+            if (idx >= 0) {
+              // Never overwrite the locked default.
+              if (store.creatorPresets[idx].locked) continue;
+              if (force == false) {
+                // S-BUG1: bump mtime so the kept-local copy is pushed next tick.
+                store.creatorPresets[idx].mtime = keptLocalBump(serverTime);
+                appliedAny = true;
+                continue;
+              }
+              if (force != true &&
+                  store.creatorPresets[idx].mtime >= incoming.mtime) {
+                continue;
+              }
+              store.creatorPresets[idx] = incoming;
+            } else {
+              // Never add a second "locked default" via sync.
+              if (incoming.locked) continue;
+              store.creatorPresets.add(incoming);
+            }
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            debugPrint('[SyncEngine] skip bad creatorPreset "$id": $e');
+          }
+        }
+      }
+
+      // Wave CY.18.261: apply incoming PROVIDER records (config + encrypted
+      // API key). Gated on the LOCAL opt-in flag — if the user has key-sync
+      // OFF on THIS device, provider records are ignored entirely (even if a
+      // peer pushed them). LWW upsert by id; the encrypted key, when it
+      // decrypts with our bearer-derived secret, is adopted and persisted to
+      // OS-secure storage. A decrypt failure (re-paired, tampered, wrong
+      // bearer) keeps the config but NEVER wipes an existing local key.
+      // Async (crypto + SecureKeys), so it's awaited explicitly below.
+      Future<void> applyProviders() async {
+        if (!store.uiPrefs.syncProviderKeys) return;
+        final list = (updates['providers'] as List?) ?? const [];
+        if (list.isEmpty) return;
+        final secret = await _keySyncSecret();
+        if (secret == null) {
+          // Blocker 4 MIRROR (Codex review r5): there are provider records to
+          // apply but no pairing secret to decrypt their keys. Silently skipping
+          // + advancing the pull watermark would lose the keys forever. Throw so
+          // the tick's outer catch skips the watermark advance and re-pulls next
+          // tick (when the bearer/secret is available, e.g. after a re-pair).
+          throw _SyncError(
+              'provider key-sync: pairing secret unavailable — holding pull');
+        }
+        for (final raw in list) {
+          if (raw is! Map) continue;
+          final m = raw.cast<String, dynamic>();
+          final id = m['id'] as String?;
+          if (id == null) continue;
+          // Per-record isolation: a poison record must not abort the tick — BUT
+          // a _SyncError (a hold-worthy key failure) MUST escape so the watermark
+          // is held (Codex r5).
+          try {
+            // Wave CY.18.256: a local tombstone at/after the incoming version
+            // means we deleted this provider — don't resurrect a peer's stale
+            // copy (see applyChars for rationale).
+            final incomingMtime = (m['mtime'] as num?)?.toInt() ?? 0;
+            if (store.isTombstonedNewer('provider', id, incomingMtime)) {
+              continue;
+            }
+            final envPresent = m['apiKeyEnc'] is String &&
+                (m['apiKeyEnc'] as String).isNotEmpty;
+            final idx = store.providers.indexWhere((p) => p.id == id);
+            if (idx >= 0 && store.providers[idx].mtime >= incomingMtime) {
+              // Wave CY.18.267: LWW says our config is at least as fresh, so we
+              // won't replace it. BUT backfill a MISSING key (restore-then-enable
+              // flow). Blocker 4: the envelope PROMISED a key — a decrypt miss
+              // must HOLD (never advance past a dropped key); the durable write
+              // must land BEFORE the RAM adopt, checked, or a swallowed failure
+              // loses the key on restart.
+              if (store.providers[idx].apiKey.isEmpty) {
+                final (_, fillKey) = await decodeIncomingProvider(m, secret);
+                if (envPresent && fillKey == null) {
+                  throw _SyncError(
+                      'provider $id: key decrypt returned null — holding pull');
+                }
+                if (fillKey != null && fillKey.isNotEmpty) {
+                  if (!await SecureKeys.tryWrite(id, fillKey)) {
+                    throw _SyncError(
+                        'provider $id: keystore write failed — holding pull');
+                  }
+                  // Re-resolve after the write await; adopt only if still empty
+                  // (a concurrent local edit may have set a key / removed it).
+                  final j = store.providers.indexWhere((p) => p.id == id);
+                  if (j >= 0 && store.providers[j].apiKey.isEmpty) {
+                    store.providers[j].apiKey = fillKey;
+                    appliedAny = true;
+                    appliedCount++; // SYNC W5
+                  }
+                }
+              }
+              continue;
+            }
+            // Decode config + (maybe) decrypt the key via the pure helper.
+            final (incoming, decryptedKey) =
+                await decodeIncomingProvider(m, secret);
+            if (envPresent && decryptedKey == null) {
+              throw _SyncError(
+                  'provider $id: key decrypt returned null — holding pull');
+            }
+            // Preserve the existing local plaintext key as the floor — a
+            // never-keyed record must NEVER wipe a key the user already has.
+            incoming.apiKey = idx >= 0 ? store.providers[idx].apiKey : '';
+            if (decryptedKey != null) {
+              // Durable write FIRST (checked); adopt into RAM only on success.
+              if (!await SecureKeys.tryWrite(id, decryptedKey)) {
+                throw _SyncError(
+                    'provider $id: keystore write failed — holding pull');
+              }
+              incoming.apiKey = decryptedKey;
+            }
+            // Re-resolve after the awaits before committing (a concurrent local
+            // edit may have moved/removed the provider). Re-check the tombstone
+            // too (Codex r6) so a concurrent DELETE during the awaits doesn't
+            // get its provider resurrected by the add below.
+            if (store.isTombstonedNewer('provider', id, incomingMtime)) continue;
+            final j = store.providers.indexWhere((p) => p.id == id);
+            if (j >= 0) {
+              if (store.providers[j].mtime >= incomingMtime) continue; // lost LWW
+              store.providers[j] = incoming;
+            } else {
+              store.providers.add(incoming);
+            }
+            appliedAny = true;
+            appliedCount++; // SYNC W5
+          } catch (e) {
+            if (e is _SyncError) rethrow; // hold-worthy → abort tick, hold watermark
+            debugPrint('[SyncEngine] skip bad provider "$id": $e');
+          }
+        }
+      }
+
+      // Wave CY.18.256: apply pulled tombstones. For each `kind:id -> mtime`
+      // we take `max(existing, incoming)` into our local log AND hard-remove
+      // the matching live record if its mtime is older than the tombstone
+      // (it was deleted on a peer). Runs AFTER the record applies above so
+      // a record that arrived in the SAME pull but is covered by a newer
+      // tombstone here gets reaped immediately. (The per-record skip above
+      // already blocks resurrection from a tombstone we recorded LOCALLY;
+      // this branch is what makes a PEER's delete win on this device.)
+      // Wave CY.18.261: async because the `provider` arm also deletes the
+      // reaped provider's key from OS-secure storage. Iterate the entries
+      // sequentially (await inside) instead of forEach so the SecureKeys
+      // delete is properly awaited.
+      Future<void> applyTombstones() async {
+        final pulledTombstones =
+            (pulled['tombstones'] as Map?)?.cast<String, dynamic>() ?? {};
+        if (pulledTombstones.isEmpty) return;
+        for (final entry in pulledTombstones.entries) {
+          final key = entry.key;
+          final raw = entry.value;
+          final incomingMtime = (raw as num?)?.toInt() ?? 0;
+          if (incomingMtime <= 0) continue;
+          final existing = store.tombstones[key] ?? 0;
+          if (incomingMtime > existing) {
+            store.tombstones[key] = incomingMtime;
+          }
+          // Reap the matching live record if it's older-or-same as the tombstone.
+          // S-BUG3: was `mtime < effective` (strict), now `mtime <= effective`
+          // to match isTombstonedNewer's `>=` boundary. At equality the server
+          // clamps both a record-push and its tombstone to the same serverNow;
+          // the old strict-< left the record live AND tombstoned (divergence).
+          // Key shape is `<kind>:<id>`; split on the FIRST colon only (ids
+          // are UUIDs without colons, but be defensive).
+          final sep = key.indexOf(':');
+          if (sep <= 0) continue;
+          final kind = key.substring(0, sep);
+          final id = key.substring(sep + 1);
+          final effective = store.tombstones[key] ?? incomingMtime;
+          switch (kind) {
+            case 'character':
+              final removed = store.characters
+                  .where((c) => c.id == id && c.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.characters
+                    .removeWhere((c) => c.id == id && c.mtime <= effective);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+            case 'persona':
+              final removed = store.personas
+                  .where((p) => p.id == id && p.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.personas
+                    .removeWhere((p) => p.id == id && p.mtime <= effective);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+            case 'chat':
+              final removed = store.chats
+                  .where((c) => c.id == id && c.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.chats
+                    .removeWhere((c) => c.id == id && c.mtime <= effective);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+            case 'preset':
+              // Never reap the locked default — it is rebuilt-from-build on
+              // every load and is intentionally never synced/deleted.
+              final removed = store.presets
+                  .where((p) => p.id == id && !p.locked && p.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.presets.removeWhere(
+                    (p) => p.id == id && !p.locked && p.mtime <= effective);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+            case 'lorebook':
+              final removed = store.lorebooks
+                  .where((l) => l.id == id && l.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.lorebooks
+                    .removeWhere((l) => l.id == id && l.mtime <= effective);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+            case 'regexRule':
+              final removed = store.regexRules
+                  .where((r) => r.id == id && r.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.regexRules
+                    .removeWhere((r) => r.id == id && r.mtime <= effective);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+            case 'folder':
+              // Mega-audit 2026-06-05 (F2): reap a folder deleted on a peer.
+              final removed = store.folders
+                  .where((f) => f.id == id && f.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.folders
+                    .removeWhere((f) => f.id == id && f.mtime <= effective);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+            case 'creatorPreset':
+              // Never reap the locked default — rebuilt-from-build on load.
+              final removed = store.creatorPresets
+                  .where((p) =>
+                      p.id == id && !p.locked && p.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.creatorPresets.removeWhere(
+                    (p) => p.id == id && !p.locked && p.mtime <= effective);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+            case 'provider':
+              // Wave CY.18.261: a deleted provider also drops its key from
+              // OS-secure storage so a stale secret never lingers. Mirror the
+              // server reap arm: remove the live record then SecureKeys.delete
+              // (awaited) when we actually reaped.
+              final removed = store.providers
+                  .where((p) => p.id == id && p.mtime <= effective)
+                  .isNotEmpty;
+              if (removed) {
+                store.providers
+                    .removeWhere((p) => p.id == id && p.mtime <= effective);
+                await SecureKeys.delete(id);
+                appliedAny = true;
+            appliedCount++; // SYNC W5
+              }
+              break;
+          }
+        }
+      }
+
+      // Mega-audit 2026-06-05 (H-4): if the user DISMISSED the conflict
+      // dialog, apply NOTHING this tick and hold the watermark (below) so the
+      // diverged records are re-pulled next tick instead of being silently
+      // LWW'd or lost. The push is also skipped so we don't half-resolve.
+      if (!conflictAbort) {
+        applySettings(); // SYNC W3: usage settings + role pointers (LWW unit).
+        applyBotbooruProfile(); // BotBooru profile (own LWW singleton unit).
+        applyChars();
+        applyPersonas();
+        applyChats();
+        applyPresets();
+        applyLorebooks();
+        applyRegex();
+        applyFolders();
+        applyCreatorPresets();
+        // 2026-06-15 audit S-BUG4: tombstones applied BEFORE providers so that
+        // isTombstonedNewer (consulted in applyProviders) already reflects a
+        // same-pull tombstone. Previously providers ran first, writing the
+        // plaintext key to OS-secure storage; if the tick was killed between
+        // the key-write and the reap, the deleted provider's key persisted in
+        // secure storage with no live record. Re-ordering is safe because
+        // applyTombstones hard-removes any live record whose mtime is <=
+        // tombstoneMtime — providers with a newer mtime than the tombstone are
+        // untouched, which is the correct outcome.
+        //
+        // The OLD comment below was "await applyProviders first"; that is now
+        // reversed intentionally.
+        await applyTombstones();
+        // Wave CY.18.261: providers carry an encrypted key + need SecureKeys
+        // writes. Runs AFTER tombstones (see S-BUG4 above) so a provider
+        // delete in the same payload is already reflected by isTombstonedNewer
+        // inside applyProviders, causing it to skip the key-write for deleted
+        // providers.
+        await applyProviders();
+        // Fetch any newly-referenced attachment blobs BEFORE the final
+        // notify so the UI rebuild already sees the bytes on disk and
+        // renders avatars/gallery images instead of broken placeholders.
+        // Best-effort: a failed/missing blob never blocks the merge.
+        if (touchedRefs.isNotEmpty) {
+          await _reconcileAttachments(touchedRefs);
+        }
+        // Sync-B (Codex review r6): persist pulled data DURABLY before the tick
+        // advances the pull watermark (the mirror of the /push stage-5 fix). The
+        // apply paths only schedule a debounced save (~600ms); the watermark is
+        // then written synchronously to SharedPreferences. A kill in that gap —
+        // or an AppStore persist failure while the prefs write succeeds — would
+        // load OLD data with a NEW cursor on restart, and the hub never
+        // re-sends → silent loss. Flush for any pull that RETURNED records (even
+        // all-superseded: a retry after a failed persist has the data in RAM but
+        // maybe not on disk). Hold the watermark (throw) on a persist failure.
+        if (pullReturnedData) {
+          if (appliedAny) store.notifyAndPersist(); // repaint on real change
+          await store.flushPersist();
+          if (store.lastPersistFailed) {
+            throw _SyncError('pull persist failed — holding watermark');
+          }
+        }
+      }
+
+      // ---- 2. PUSH (skip during in-flight generation) ----
+      // Wave CY.18.255 (FIX 4): true while the push came back with a
+      // rejection we should NOT lose by advancing the watermark past it.
+      // A "server-newer" rejection is benign — the next /pull surfaces the
+      // server's newer copy and LWW converges. But ANY OTHER rejection
+      // (e.g. an unknown collection, a future server-side validation
+      // refusal) means our local record never landed AND won't come back
+      // on /pull. If we advanced `_lastServerTime` past it, `_collectDirty`
+      // (which only re-sends `mtime > _lastServerTime`) would never offer
+      // it again → silent local-edit loss. So we keep the prior watermark
+      // this tick to force a corrective re-push next tick.
+      var pushHadHardReject = false;
+      // SYNC W5 (transparency UI): records the server ACCEPTED this push (from
+      // the push response's `accepted` count). Stays 0 when there was nothing
+      // dirty to send. Surfaced as "Pushed N".
+      var pushedCount = 0;
+      // Sync-B (2026-07-17, Codex, stage 2): capture the LOGICAL push boundary —
+      // the monotonic counter, NOT a wall clock — BEFORE the collection snapshot
+      // (mirrors the server's stamp-before-select fix, S-BUG2). Every locally
+      // stamped record has `mtime <= lastIssuedLocalMtime`, so advancing the
+      // cursor to this value marks exactly the shipped records clean; anything
+      // written after the capture gets a strictly higher mtime and is caught
+      // next tick. Using wall-clock here (the old `pushClock`) stranded records
+      // whose monotonic mtime out-ran a rolled-back clock ("dirty forever").
+      // `pushRan` stays false when the push is skipped (generation in-flight /
+      // conflict abort) so the cursor is HELD and those writes aren't lost.
+      final pushBoundary = store.lastIssuedLocalMtime;
+      var pushRan = false;
+      if (!GenerationKeepAlive.isGenerating && !conflictAbort) {
+        pushRan = true;
+        // Push collection filters by the CLIENT-domain cursor (_lastPushTime),
+        // NOT the SERVER-domain watermark (_lastServerTime) — see nextPushCursor.
+        final dirty = _collectDirty(store, _lastPushTime);
+        // Wave CY.18.261: include the PROVIDERS collection in the push ONLY
+        // when the user opted in (syncProviderKeys). Each provider is emitted
+        // via toJsonEncrypted — config in cleartext, the API key as an
+        // AES-GCM envelope (never plaintext) keyed by our bearer-derived
+        // secret. Same `mtime > since` window as every other collection. Flag
+        // OFF (default) ⇒ the `providers` key is absent entirely (the server
+        // also gates, but we don't even ship it). _collectDirty stays sync +
+        // pure; the encryption (async) is layered on here.
+        if (store.uiPrefs.syncProviderKeys) {
+          final secret = await _keySyncSecret();
+          if (secret != null) {
+            final out = <Map<String, dynamic>>[];
+            for (final p in store.providers) {
+              if (p.mtime > _lastPushTime) {
+                out.add(await p.toJsonEncrypted(secret));
+              }
+            }
+            dirty['providers'] = out;
+          }
+        }
+        // Wave CY.18.256: deletion-propagation. Send only the tombstones the
+        // server hasn't seen (mtime > since) so the server learns about our
+        // local deletes and reaps its still-live copies. Additive: an old
+        // server ignores the unknown `tombstones` key.
+        final dirtyTombstones = _collectDirtyTombstones(store, _lastPushTime);
+        final hasDirty = dirty.values.any((l) => l.isNotEmpty);
+        // Push when we have dirty records OR dirty tombstones — a tick whose
+        // only change is a deletion still needs to reach the server.
+        if (hasDirty || dirtyTombstones.isNotEmpty) {
+          final pushResp = await http
+              .post(
+                Uri.parse('${client.baseUrl}/push'),
+                headers: {
+                  ..._authHeaders(),
+                  'content-type': 'application/json',
+                },
+                body: jsonEncode({
+                  // Sync-B stage 3 (2026-07-17, Codex): advertise v2 so the hub
+                  // returns exhaustive per-item `results`. An old hub ignores
+                  // this key and answers with the legacy {accepted, rejected}.
+                  'syncProtocol': 2,
+                  'updates': dirty,
+                  if (dirtyTombstones.isNotEmpty) 'tombstones': dirtyTombstones,
+                }),
+              )
+              .timeout(_httpTimeout);
+          if (pushResp.statusCode == 401) {
+            await client.disconnect();
+            throw _SyncError('Server revoked this device.');
+          }
+          if (pushResp.statusCode != 200) {
+            // Stage 5: a 503 means the hub could not PERSIST our push. Throwing
+            // holds the push cursor (the advance is gated on no error) so the
+            // records re-collect and re-push next tick — never silently lost.
+            throw _SyncError(
+                'Push HTTP ${pushResp.statusCode}: ${pushResp.body}');
+          }
+          var reconcileDirty = false;
+          try {
+            final j = jsonDecode(pushResp.body);
+            // SYNC W5 (transparency UI): how many records the hub took.
+            final acc = j['accepted'];
+            if (acc is num) {
+              pushedCount = acc.toInt();
+            } else if (acc is List) {
+              pushedCount = acc.length;
+            }
+            final results = j['results'];
+            if (results is List) {
+              // Sync-B stage 3: HONEST per-item path (v2 hub). See
+              // syncPushHoldForResults for the advance-vs-hold contract.
+              pushHadHardReject = syncPushHoldForResults(results);
+              // Blocker 2 (Codex review r2): reconcile every item the hub gave a
+              // revision (accepted AND superseded — the tie-divergence happens
+              // on a superseded snapshot too). Observing serverMtime stops the
+              // client re-minting the SAME value the hub restamped to (the tie);
+              // an item edited DURING the push is re-bumped above serverMtime so
+              // it re-pushes and wins instead of tying forever.
+              for (final r in results) {
+                if (r is! Map) continue;
+                final code = r['code'];
+                if (code != 'accepted' && code != 'superseded') continue;
+                final sm = (r['serverMtime'] as num?)?.toInt();
+                final cm = (r['clientMtime'] as num?)?.toInt();
+                if (sm == null || cm == null) continue;
+                reconcileDirty |= store.reconcilePushedRevision(
+                    r['collection']?.toString() ?? '', cm, sm,
+                    id: r['id']?.toString());
+              }
+              if (kDebugMode) {
+                debugPrint(
+                    '[SyncEngine] push v2: $pushedCount accepted, '
+                    '${results.length} results'
+                    '${pushHadHardReject ? ' (unsupported/garbled present — '
+                        'holding watermark for retry)' : ''}');
+              }
+            } else {
+              // LEGACY path (old hub, no `results`): key off the benign-reject
+              // reason string exactly as before — any OTHER reason is hard.
+              final rejected = (j['rejected'] as List?) ?? const [];
+              const serverNewerReason = 'server has newer mtime';
+              pushHadHardReject = rejected.any((r) =>
+                  r is Map &&
+                  (r['reason']?.toString() ?? '') != serverNewerReason);
+              if (kDebugMode) {
+                debugPrint(
+                    '[SyncEngine] push (legacy): ${j['accepted']} accepted, '
+                    '${rejected.length} rejected'
+                    '${pushHadHardReject ? ' (non-server-newer present — '
+                        'holding watermark for retry)' : ''}');
+              }
+            }
+          } catch (_) {
+            // We asked for v2; every real Pyre hub (v1 or v2) returns parseable
+            // JSON, so an unparseable 200 is anomalous. HOLD the cursor and
+            // retry rather than advance over records we can't confirm landed.
+            pushHadHardReject = true;
+          }
+          // Blocker 2 (Codex review r2): a reconcile re-bump / counter raise
+          // must be DURABLE before we advance the push cursor. If the edit's own
+          // debounced save already ran and we only bumped in memory, a crash
+          // before the next save would restore the tied mtime and reopen the
+          // divergence. Persist now; if it fails, HOLD the cursor (the re-bumped
+          // record stays dirty and re-pushes next tick).
+          if (reconcileDirty) {
+            store.notifyAndPersist();
+            await store.flushPersist();
+            if (store.lastPersistFailed) pushHadHardReject = true;
+          }
+        }
+        // Sync-B stage 6 (2026-07-17, Codex): re-negotiate MISSING attachment
+        // blobs on EVERY non-generating tick — not only when a record was dirty
+        // this tick. The old hasDirty gate stranded a blob whose one upload
+        // failed: the record was accepted (cursor advanced), but with no later
+        // dirty record the negotiation never ran again, so a peer kept showing a
+        // broken image forever. The /attachments/missing round-trip is deduped
+        // and returns empty when the hub already holds everything, so a steady
+        // state costs one cheap request. Best-effort — never blocks the tick.
+        await _pushAttachments(collectReferencedAttachmentHashes(store));
+      }
+
+      // ---- 3. Persist new high-water mark ----
+      // Hold the watermark if a hard reject occurred so the rejected
+      // record (still `mtime > _lastServerTime`) is re-collected and
+      // re-pushed on the next tick. The normal all-accepted (or
+      // server-newer-only) path advances as before.
+      // Mega-audit 2026-06-05 (H-4): also hold the watermark when the user
+      // dismissed the conflict dialog (conflictAbort), so the diverged records
+      // (still `mtime > _lastServerTime` on the server) come back on the next
+      // /pull and the user gets another chance to resolve them.
+      if (!pushHadHardReject && !conflictAbort) {
+        _lastServerTime = serverTime;
+        // Sync-B (stage 2): advance the LOGICAL push cursor to pushBoundary.
+        // nextPushCursor HOLDS it when the push didn't run
+        // (pushRan == false, e.g. generation in-flight) so writes made while it
+        // was skipped re-collect next tick, and never moves it backwards. The
+        // hard-reject / conflict-abort gates are already enforced by this `if`,
+        // but passing them keeps nextPushCursor self-contained + unit-testable.
+        final newPushCursor = nextPushCursor(
+          current: _lastPushTime,
+          pushBoundary: pushBoundary,
+          pushRan: pushRan,
+          hardReject: pushHadHardReject,
+          conflictAbort: conflictAbort,
+        );
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setInt(_prefLastServerTime, serverTime);
+          if (newPushCursor != _lastPushTime) {
+            await prefs.setInt(_prefLastPushTime, newPushCursor);
+          }
+        } catch (_) {}
+        _lastPushTime = newPushCursor;
+        // Tier-1 H-1: publish the freshly-advanced cursor so the store's
+        // tombstone GC won't reap a deletion we haven't confirmed pushed.
+        store.setSyncedPushWatermark(_lastPushTime);
+      }
+
+      _consecutiveFailures = 0;
+      _lastSuccessAt = DateTime.now();
+      _lastError = null;
+      // SYNC W5 (transparency UI): publish this tick's movement so the
+      // SyncStatusPill / LAN screen can show "Pulled N · Pushed N". Set only
+      // on success — a failed tick keeps the last good numbers on screen.
+      _lastPulledCount = appliedCount;
+      _lastPushedCount = pushedCount;
+      // `_setStatus` no-ops (no notify) when the status is ALREADY `success`
+      // (e.g. two manual syncs in a row), but the metrics + `lastSuccessAt`
+      // just changed and the UI must repaint. Notify directly in that case so
+      // the relative-time + counts stay live; otherwise let `_setStatus` do it.
+      if (_status == SyncStatus.success) {
+        notifyListeners();
+      } else {
+        _setStatus(SyncStatus.success);
+      }
+    } catch (e) {
+      _consecutiveFailures++;
+      _lastError = e is _SyncError ? e.message : e.toString();
+      debugPrint('[SyncEngine] tick failed: $_lastError');
+      if (_consecutiveFailures >= 2) {
+        _setStatus(SyncStatus.offline);
+      } else {
+        _setStatus(SyncStatus.warning);
+      }
+    } finally {
+      _tickInFlight = false;
+    }
+  }
+
+  Map<String, List<Map<String, dynamic>>> _collectDirty(
+      AppStore store, int since) {
+    return {
+      // SYNC W3: the usage SETTINGS unit (model/chat/memory/liveSheet/script/
+      // guide + the active/creator/vision role pointers). A single-element list
+      // (it's a singleton record) shipped only when its `settingsMtime` is
+      // newer than the watermark — same `mtime > since` gate as every
+      // collection. Excludes the chat background image (see syncedSettingsToJson).
+      if (store.settingsMtime > since) 'settings': [store.syncedSettingsToJson()],
+      // The BotBooru PROFILE unit — its OWN single-element singleton list,
+      // shipped only when `botbooruProfileMtime` is newer than the watermark
+      // (same `mtime > since` gate + LWW as `settings`).
+      if (store.botbooruProfileMtime > since)
+        'botbooruProfile': [store.syncedBotbooruProfileToJson()],
+      'characters': store.characters
+          .where((c) => c.mtime > since)
+          .map((c) => c.toJson())
+          .toList(),
+      'personas': store.personas
+          .where((p) => p.mtime > since)
+          .map((p) => p.toJson())
+          .toList(),
+      'chats': store.chats
+          .where((c) => c.mtime > since)
+          .map((c) => c.toJson())
+          .toList(),
+      'presets': store.presets
+          .where((p) => p.mtime > since && !p.locked)
+          .map((p) => p.toJson())
+          .toList(),
+      'lorebooks': store.lorebooks
+          .where((l) => l.mtime > since)
+          .map((l) => l.toJson())
+          .toList(),
+      // Pyre 1.1 (F4): regex rules ride the synced set.
+      'regexRules': store.regexRules
+          .where((r) => r.mtime > since)
+          .map((r) => r.toJson())
+          .toList(),
+      // Mega-audit 2026-06-05 (F2): library folders.
+      'folders': store.folders
+          .where((f) => f.mtime > since)
+          .map((f) => f.toJson())
+          .toList(),
+      // Mega-audit 2026-06-05 (F2): forkable Creator presets — locked default
+      // excluded (rebuilt-from-build on every load).
+      'creatorPresets': store.creatorPresets
+          .where((p) => p.mtime > since && !p.locked)
+          .map((p) => p.toJson())
+          .toList(),
+    };
+  }
+
+  /// Mega-audit 2026-06-05 (H-4): build the list of genuine conflicts in an
+  /// incoming /pull payload — records that changed on BOTH this device and the
+  /// peer since [lastSyncAt]. Covers the user-authored collections (characters,
+  /// personas, chats, presets, lorebooks, regexRules, folders, creatorPresets);
+  /// providers are deliberately EXCLUDED (their encrypted-key + missing-key-
+  /// backfill semantics have their own careful path that the conflict override
+  /// must not disturb). Incoming tombstones are folded in as a `deleted` remote
+  /// ref so an edit-vs-remote-delete divergence is surfaced too. PURE detection
+  /// runs in [detectSyncConflicts]; this method only adapts the records to refs.
+  List<SyncConflict> _detectConflictsForPull(
+    AppStore store,
+    Map<String, dynamic> updates,
+    int lastSyncAt,
+  ) {
+    final local = <SyncRecordRef>[];
+    final remote = <SyncRecordRef>[];
+
+    void addLocal(String kind, String id, int mtime, String name) {
+      local.add(SyncRecordRef(kind: kind, id: id, mtime: mtime, name: name));
+    }
+
+    // Local refs for every conflict-eligible collection.
+    for (final c in store.characters) {
+      addLocal('character', c.id, c.mtime, c.name);
+    }
+    for (final p in store.personas) {
+      addLocal('persona', p.id, p.mtime, p.name);
+    }
+    for (final c in store.chats) {
+      addLocal('chat', c.id, c.mtime, c.title ?? 'Chat');
+    }
+    for (final p in store.presets) {
+      if (!p.locked) addLocal('preset', p.id, p.mtime, p.name);
+    }
+    for (final l in store.lorebooks) {
+      addLocal('lorebook', l.id, l.mtime, l.name);
+    }
+    for (final r in store.regexRules) {
+      addLocal('regexRule', r.id, r.mtime, r.name);
+    }
+    for (final f in store.folders) {
+      addLocal('folder', f.id, f.mtime, f.name);
+    }
+    for (final p in store.creatorPresets) {
+      if (!p.locked) addLocal('creatorPreset', p.id, p.mtime, p.name);
+    }
+
+    // Incoming (remote) refs from the pulled `updates`, keyed by collection.
+    void addRemoteList(String collection, String kind, String Function(Map) nm) {
+      final list = (updates[collection] as List?) ?? const [];
+      for (final raw in list) {
+        if (raw is! Map) continue;
+        final m = raw.cast<String, dynamic>();
+        final id = m['id'] as String?;
+        if (id == null) continue;
+        final mtime = (m['mtime'] as num?)?.toInt() ?? 0;
+        remote.add(SyncRecordRef(
+          kind: kind,
+          id: id,
+          mtime: mtime,
+          name: nm(m),
+          deleted: (m['deleted'] as bool?) ?? false,
+        ));
+      }
+    }
+
+    addRemoteList('characters', 'character',
+        (m) => (m['name'] as String?) ?? '');
+    addRemoteList('personas', 'persona', (m) => (m['name'] as String?) ?? '');
+    addRemoteList('chats', 'chat', (m) => (m['title'] as String?) ?? 'Chat');
+    addRemoteList('presets', 'preset', (m) => (m['name'] as String?) ?? '');
+    addRemoteList('lorebooks', 'lorebook', (m) => (m['name'] as String?) ?? '');
+    addRemoteList('regexRules', 'regexRule', (m) => (m['name'] as String?) ?? '');
+    addRemoteList('folders', 'folder', (m) => (m['name'] as String?) ?? '');
+    addRemoteList('creatorPresets', 'creatorPreset',
+        (m) => (m['name'] as String?) ?? '');
+
+    return detectSyncConflicts(local, remote, lastSyncAt);
+  }
+
+  /// 2026-06-15 audit S-BUG1: compute the bumped mtime for a keep-local
+  /// conflict resolution. The chosen value must be:
+  ///   (a) strictly greater than [serverTime] so `mtime > since` (where
+  ///       `since` == this tick's serverTime) includes the record in the next
+  ///       _collectDirty push — making "Keep this device" durable.
+  ///   (b) strictly greater than the peer's copy so LWW on the next /pull
+  ///       keeps the local version instead of silently overwriting it.
+  ///
+  /// We satisfy both by taking `max(now, serverTime + 1)`. Using `now` is
+  /// natural (we just edited the record's resolution), but if the wall clock
+  /// is behind the server's stamp (clock-skew scenario), `serverTime + 1`
+  /// is the safe floor.
+  static int _keepLocalMtime(int serverTime) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    return now > serverTime + 1 ? now : serverTime + 1;
+  }
+
+  /// Wave CY.18.256: tombstones recorded since the last watermark. Same
+  /// `mtime > since` gate as [_collectDirty] so we only ship deletions the
+  /// server hasn't already seen. Returns `{ 'kind:id': mtime }`.
+  Map<String, int> _collectDirtyTombstones(AppStore store, int since) {
+    final out = <String, int>{};
+    store.tombstones.forEach((key, mtime) {
+      if (mtime > since) out[key] = mtime;
+    });
+    return out;
+  }
+
+  /// Wave CY.18.254: pull the BLOB BYTES for attachment refs that just
+  /// arrived over /pull but aren't in the local content-addressed store
+  /// yet. Synced records carry `pyre://attachment/<hash>` refs (avatars +
+  /// gallery images); the refs replicate but the bytes do not, so on a
+  /// fresh client every such image renders broken until we fetch it from
+  /// the desktop server's `GET /attachments/<hash>` endpoint.
+  ///
+  /// Native only — `AttachmentStore` is a no-op on web (no filesystem),
+  /// where the proper fix is to render `pyre://` images straight from the
+  /// server URL (separate follow-up). Best-effort + isolated per blob: a
+  /// failed or missing attachment is logged and skipped, never thrown out
+  /// of the sync tick. Fetched sequentially — galleries are a handful of
+  /// images, so there's no need to fan out dozens of parallel requests.
+  Future<void> _reconcileAttachments(Set<String> refs) async {
+    if (kIsWeb) return;
+    final client = LanClient.instance;
+    final baseUrl = client.baseUrl;
+    if (baseUrl == null) return;
+    for (final ref in refs) {
+      if (!AttachmentStore.isPyreUrl(ref)) continue;
+      final hash = ref.substring(AttachmentStore.urlPrefix.length);
+      if (hash.isEmpty) continue;
+      try {
+        // Already have the bytes locally? `fileFor` returns null when the
+        // backing file is missing, so a non-null result means "present".
+        final existing = await AttachmentStore.fileFor(ref);
+        if (existing != null) continue;
+
+        final resp = await http
+            .get(Uri.parse('$baseUrl/attachments/$hash'),
+                headers: _authHeaders())
+            .timeout(_httpTimeout);
+        if (resp.statusCode != 200) {
+          debugPrint(
+              '[SyncEngine] attachment $hash fetch HTTP ${resp.statusCode}');
+          continue;
+        }
+        final mime = resp.headers['content-type'];
+        await AttachmentStore.store(
+          resp.bodyBytes,
+          mime: (mime != null && mime.isNotEmpty) ? mime : 'image/png',
+        );
+      } catch (e) {
+        debugPrint('[SyncEngine] attachment $hash reconcile failed: $e');
+      }
+    }
+  }
+
+  /// SYNC W7 (attachment volume): upload to the server ONLY the attachment
+  /// blobs it is MISSING, negotiated via `POST /attachments/missing`. This is
+  /// the phone→PC counterpart of [_reconcileAttachments] (which only DOWNLOADS
+  /// on pull) — without it, pushed records carry `pyre://` refs but the bytes
+  /// never reach the PC, so its avatars/gallery render broken.
+  ///
+  /// Volume-safe by construction: each blob is content-addressed, so the
+  /// negotiation means an image transfers AT MOST ONCE, ever — never the
+  /// "re-send 2-3 GB of images the peer already has" blowup. If the server is
+  /// too old to support the negotiation (non-200), we SKIP uploading entirely
+  /// rather than blindly bulk-uploading (which would be exactly that blowup).
+  /// Best-effort + native-only; a failed blob is logged and skipped, never
+  /// thrown out of the sync tick.
+  Future<void> _pushAttachments(Set<String> hashes) async {
+    if (kIsWeb || hashes.isEmpty) return;
+    final client = LanClient.instance;
+    final baseUrl = client.baseUrl;
+    if (baseUrl == null) return;
+
+    Set<String> missing;
+    try {
+      final resp = await http
+          .post(
+            Uri.parse('$baseUrl/attachments/missing'),
+            headers: {..._authHeaders(), 'content-type': 'application/json'},
+            body: jsonEncode({'hashes': hashes.toList()}),
+          )
+          .timeout(_httpTimeout);
+      // Old server (no negotiation route) or any error → SKIP. We deliberately
+      // do NOT fall back to uploading everything: that's the volume blowup.
+      if (resp.statusCode != 200) return;
+      final body = jsonDecode(resp.body) as Map<String, dynamic>;
+      missing = ((body['missing'] as List?)?.whereType<String>() ??
+              const <String>[])
+          .toSet();
+    } catch (e) {
+      debugPrint('[SyncEngine] attachments/missing negotiation failed: $e');
+      return;
+    }
+
+    for (final hash in missing) {
+      try {
+        final url = '${AttachmentStore.urlPrefix}$hash';
+        final bytes = await AttachmentStore.readBytes(url);
+        if (bytes == null) continue; // we don't hold the bytes either
+        final mime =
+            await AttachmentStore.mimeFor(url) ?? 'application/octet-stream';
+        final up = await http
+            .post(
+              Uri.parse('$baseUrl/attachments'),
+              headers: {..._authHeaders(), 'content-type': mime},
+              body: bytes,
+            )
+            .timeout(_httpTimeout);
+        if (up.statusCode != 201) {
+          debugPrint(
+              '[SyncEngine] attachment $hash upload HTTP ${up.statusCode}');
+        }
+      } catch (e) {
+        debugPrint('[SyncEngine] attachment $hash upload failed: $e');
+      }
+    }
+  }
+
+  Map<String, String> _authHeaders() {
+    final token = LanClient.instance.bearerToken ?? '';
+    return {
+      'authorization': 'Bearer $token',
+      // Mega-audit 2026-06-05 (Item 3 / Finding 2): advertise native-ness on
+      // every authenticated request so the server can self-heal a legacy
+      // device whose stored `isNative` defaulted to false (pre-flag pairing),
+      // unblocking key-sync without a re-pair. SyncEngine runs only on native
+      // builds; web (RemoteBackend) never goes through here and never sends it.
+      if (!kIsWeb) 'x-pyre-native': '1',
+    };
+  }
+
+  /// Wave CY.18.261: the per-device key-sync secret derived from the raw
+  /// pairing bearer (the slot `lan_client` writes). Both peers derive the
+  /// SAME secret from the shared bearer, so an encrypted key envelope round-
+  /// trips. Returns null if the bearer is missing/empty (e.g. not yet paired)
+  /// — the caller then simply skips the encrypted-provider path. Best-effort:
+  /// any SecureKeys read failure surfaces as a null secret, never throws.
+  Future<SecretKey?> _keySyncSecret() async {
+    String rawBearer = '';
+    try {
+      rawBearer = await SecureKeys.read('__lan__.bearerToken');
+    } catch (_) {
+      return null;
+    }
+    if (rawBearer.isEmpty) return null;
+    return KeyCrypto.secretForBearer(rawBearer);
+  }
+}
+
+class _SyncError implements Exception {
+  final String message;
+  _SyncError(this.message);
+  @override
+  String toString() => message;
+}
+
+/// Wave CY.18.261: decode an incoming synced provider record into a parsed
+/// [ApiProvider] plus the decrypted API key (or null if there was none, or
+/// it could not be decrypted with [secret]). PURE: never touches SecureKeys,
+/// the AppStore, or any I/O beyond the crypto primitives — so the apply
+/// logic (config parse + key-decrypt) is unit-testable without a live peer.
+///
+/// Fail-closed: a missing/empty/garbled `apiKeyEnc` yields a null key, never
+/// throws. The returned provider always carries its config; the caller
+/// decides whether to adopt the key (and persists it to OS-secure storage).
+/// The parsed provider's own `apiKey` field is left as fromJson produced it
+/// (empty for synced records — the plaintext key never crosses the wire);
+/// the key, if any, comes back as the second tuple element only.
+Future<(ApiProvider, String?)> decodeIncomingProvider(
+    Map<String, dynamic> j, SecretKey secret) async {
+  final provider = ApiProvider.fromJson(j);
+  final env = j['apiKeyEnc'];
+  if (env is! String || env.isEmpty) {
+    return (provider, null);
+  }
+  // KeyCrypto.decryptApiKey already returns null (never throws) on any
+  // failure — bad json, wrong version, wrong key, tampering.
+  final decrypted = await KeyCrypto.decryptApiKey(env, secret);
+  return (provider, decrypted);
+}

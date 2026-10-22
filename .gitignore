@@ -1,0 +1,92 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Release signing - never commit. The repo's contributors and CI fall
+# back to debug signing. Production builds inject these via secrets.
+/android/key.properties
+/android/app/upload-keystore.jks
+/android/app/*.jks
+/android/app/*.keystore
+*.jks
+*.keystore
+
+# Prompt Lab generated reports and local live-mode config.
+tool/prompt_lab/out/
+tool/prompt_lab/local.json
+
+# Per-platform Gradle/build outputs. The root /build/ above only covers the
+# top-level Flutter build dir, not Android's Gradle output.
+/android/build/
+/android/.gradle/
+
+# Release/ is the web-bundle mirror that build_all.ps1 produces. It is a copy
+# of build/web, not source. Never commit it.
+/Release/
+
+# Local-only outreach drafts.
+outreach/
+
+# Local-only working docs.
+DEPLOY.md
+docs/LAUNCH_CHECKLIST.md
+docs/superpowers/
+docs/STORE_LISTING.md
+docs/COMMUNITY.md
+docs/FEATURE_INVENTORY.md
+docs/ANNOUNCEMENT.md
+docs/SMOKE_TEST.md
+docs/scene-background-library-brief.md
+docs/prompt-pipeline-audit-2026-05-31.md
+docs/live-test-findings-2026-05-31.md
+
+# Per-release announcement drafts stay local until finalized.
+docs/RELEASE_NOTES_1.1.0-DRAFT.md
+docs/company/
+tool/environment_base/
+
+# Scene background artwork stays out of the repo (generated on demand;
+# only the manifest is shipped). Never commit the images/ dir.
+/assets/scene_bg/images/
