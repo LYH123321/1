@@ -267,6 +267,8 @@ flutter:
     - assets/games/doudizhu/js/
     - assets/games/doudizhu/images/
     - assets/games/doudizhu/audio/
+    - assets/agent-skills/
+    - assets/tavern-assets/
 
   # To add more assets to your application, add to the assets section
   # above, like this:

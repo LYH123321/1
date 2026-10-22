@@ -1,0 +1,31 @@
+{
+  "format": "st-end-component-library",
+  "version": 1,
+  "exportedAt": "2026-09-03T03:13:44.526Z",
+  "libraries": {
+    "components": {
+      "groups": [
+        {
+          "name": "全局默认分组",
+          "library": "components",
+          "enabled": true,
+          "items": [
+            {
+              "name": "哭包-剧情摘要",
+              "content": "<rule name=\"剧情摘要存档\">\n基于本轮正文内容提取对应信息，严格按照下方格式完整输出，不得改动标签结构与字段顺序。\n\n【输出格式】\n\n<details data-info=\"archive\">\n<summary>✧剧情摘要✧</summary>\n- 日期时间：年-月-日 时:分 星期X 天气（温度℃ 湿度% 风向 天气现象）\n- 地点：[区域] [具体位置] [环境描述：光线/声音/气味/空间布局]\n- 关键事件回溯（最近5件，按时间倒序）\n        5. [时间] 事件描述\n        4. [时间] 事件描述\n        3. [时间] 事件描述\n        2. [时间] 事件描述\n        1. [时间] 刚刚发生的事件完整细节\n- 人物：参与本轮蓝图剧情的所有人物，动作、表情、衣着（从上到下）、手持物品、身体状态、情绪表现（通过生理反应）\n- 矛盾冲突：是否有矛盾冲突？\n- 情感线索：描述剧情中主要角色之间的情感变化和发展。\n</details>\n\n</rule>",
+              "enabled": true
+            },
+            {
+              "name": "哭包–回应预演",
+              "content": "<rule name=\"回应预演生成\">\n基于上一轮正文结尾的场景与动作状态生成内容，严格按照下方格式完整输出，不得改动标签结构与内部规则。\n\n【输出格式】\n\n<details data-fate=\"destiny\">\n<summary>✧回应预演✧</summary>\n\nEach time, 5 previews must be generated. Core constraint: Must seamlessly continue from the scene and action state at the end of the previous round's main text. Jumping time, jumping scenes, or skipping ongoing events is strictly forbidden; omitting transitions and cutting directly into a new scene is not allowed. All developments must conform to logic, character personality, and the current situation; no forced coincidences. All Mode A previews aim to establish an interactive connection between both parties; unilateral plot threads with no closed loop are forbidden.\n\n**Mode Determination**:\n- Mode A (Not converged): {{char}} and user are not in the same location, and {{char}} has no clear dialogue/action directed at user this turn.\n- Mode B (Converged): {{char}} and user are in the same location, and {{char}} has clear dialogue/action directed at user this turn.\n\n**Mode A · Dual-Line Convergence Previews (5 directions; all end with establishing an interactive connection between both parties; meetings/contact must be realistically reasonable)**:\n1. Proactive contact: One party, based on current state, has reasonable motivation to proactively initiate dialogue or an invitation, directly establishing an interactive connection between both parties.\n2. Reason-driven: An event arises that both parties have legitimate reasons to attend and handle, facilitating face-to-face interaction in the same scene.\n3. Third-party intervention: Supporting characters, messages, commissions, event entanglements, etc., logically bring about a connection between both parties.\n4. Environment-driven: Venue changes, weather, accidents, time pressure, and other realistic factors force both parties into the same place and generate contact.\n5. Accidental encounter: Based on both parties' current respective action trajectories, a realistic coincidence leads to meeting on the spot and forming interaction.\n\n**Mode B · Response Method Previews (5 directions)**:\n1. Directly receive: Directly respond to {{char}}'s last words/actions, no evasion or diversion.\n2. Side entry: Do not respond directly; enter from another angle/detail.\n3. Escalate: Push the current conflict or emotion one level higher.\n4. Step back: Do not engage, follow, or advance; proactively leave space.\n5. Unexpected move: Do something {{char}} did not anticipate but that fits user's personality.\n\n**Preview Format (General)**:\n1. 🔹 [Direction Name]\n- 契机/方向: [Mode A: Starting from the end of the previous round, how the event triggers, why it is logical, and how it promotes convergence between both parties — approximately 30 Chinese characters. Mode B: Action entry point continuing from the previous round's dialogue — approximately 30 Chinese characters.]\n- 预演:\n```text\nWritten entirely from user's first-person perspective and inherent tone of voice, in Chinese.\n【Mode A】Must include: continuing from the state at the end of the previous round → my reaction and actions → the landing point that triggers interaction. The ending must land on a node that can trigger the other party's response (message notification, meeting face-to-face, call connected, etc.), so that after sending it, it can directly enter Mode B interaction. Write only externally observable behavior and my sensory experience; do not write {{char}}'s inner thoughts. 80-120 Chinese characters.\n【Mode B】Must continue from the context and actions at the end of the previous round's dialogue. Write only what user would say and do; no inner thoughts or psychological states. At least 80 Chinese characters.\nOOC is strictly forbidden; user's personality and way of speaking are absolutely locked.\n```\n\nAll 5 previews must 100% conform to user's inherent personality and emotional baseline; only the course of action or event trajectory may change.\n\n</details>\n</rule\">",
+              "enabled": true
+            }
+          ]
+        }
+      ]
+    },
+    "theater": {
+      "groups": []
+    }
+  }
+}

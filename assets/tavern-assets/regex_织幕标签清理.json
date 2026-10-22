@@ -1,0 +1,58 @@
+{
+  "format": "st-esg-tag-cleanup",
+  "version": 1,
+  "historyRules": [
+    {
+      "rule": "thinking",
+      "keep": 0
+    },
+    {
+      "rule": "think",
+      "keep": 0
+    },
+    {
+      "rule": "re:<status_([^>]+)>([\\s\\S]*?)</status_\\1>",
+      "keep": 2
+    },
+    {
+      "rule": "content",
+      "keep": 2
+    },
+    {
+      "rule": "re:/<details data-info=\"archive\">[\\s\\S]*?<\\/details>/g",
+      "keep": 2
+    },
+    {
+      "rule": "re:/<details\\s+[^>]*data-fate\\s*=\\s*[\"']destiny[\"'][^>]*>[\\s\\S]*?<\\/details>/gi",
+      "keep": 0
+    },
+    {
+      "rule": "rian",
+      "keep": 2
+    },
+    {
+      "rule": "UpdateVariable",
+      "keep": 2
+    },
+    {
+      "rule": "bgm",
+      "keep": 3
+    },
+    {
+      "rule": "re:/<bbi_image>[\\s\\S]+?<\\/bbi_image>/gi",
+      "keep": 0
+    },
+    {
+      "rule": "status_top",
+      "keep": 2
+    },
+    {
+      "rule": "status_bottom",
+      "keep": 2
+    }
+  ],
+  "outputRules": [
+    "re:/^[\\s\\S]*?<\\/thinking>/i",
+    "re:<thinking>[\\s\\S]*?</thinking>"
+  ]
+}
