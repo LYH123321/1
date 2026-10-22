@@ -67,7 +67,7 @@ class _AgentScreenState extends State<AgentScreen> {
             k.startsWith('assets/agent-skills/') && k.endsWith('.md'))
         .toList()
       ..sort();
-    return files.map((f) => f.split('/').last).toList();
+    return files.map((f) => f.split('/').last).toList().cast<String>();
   }
 
   Future<void> _pickSkill() async {
@@ -107,7 +107,7 @@ class _AgentScreenState extends State<AgentScreen> {
             k.startsWith('assets/tavern-assets/') && k.endsWith('.json'))
         .toList()
       ..sort();
-    return files.map((f) => f.split('/').last).toList();
+    return files.map((f) => f.split('/').last).toList().cast<String>();
   }
 
   Future<void> _pickTavernAsset() async {
